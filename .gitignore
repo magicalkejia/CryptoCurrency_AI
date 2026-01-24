@@ -1,0 +1,10 @@
+# Python caches & venv
+/__pycache__
+
+
+# Data directories
+/data_storage/*
+/logs/*
+
+#env file 
+.env
