@@ -3,8 +3,10 @@
 
 
 # Data directories
-/data_storage/*
-/logs/*
+data_storage/
+logs/
 
 #env file 
 .env
+
+.vscode

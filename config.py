@@ -9,10 +9,13 @@ BASE_DIR = Path(__file__).parent.absolute()
 class PathConfig:
     """所有跟文件路径有关的配置"""
     DATA_ROOT = BASE_DIR / 'data_storage'
+    BACKTEST_ROOT = BASE_DIR / 'backtest'  #回测
+    MODELS_ROOT = BASE_DIR / 'models'   #模型
+    LOGS = BASE_DIR / 'logs'          # 日志
+
     RAW = DATA_ROOT / 'raw'
     PROCESSED = DATA_ROOT / 'processed'
-    MODELS = DATA_ROOT / 'models'     # 未来放 AI 模型
-    LOGS = BASE_DIR / 'logs'          # 未来放日志
+    MODELS = DATA_ROOT / 'models'     
 
 class SpiderConfig:
     """爬虫相关配置"""
@@ -54,6 +57,9 @@ def init_directories():
     # 获取 PathConfig 中所有不以 '__' 开头的属性（即我们定义的路径）
     paths_to_create = [
         PathConfig.DATA_ROOT,
+        PathConfig.BACKTEST_ROOT,
+        PathConfig.MODELS_ROOT,
+
         PathConfig.RAW,
         PathConfig.PROCESSED,
         PathConfig.MODELS,
