@@ -1,7 +1,7 @@
 import time
 import config
-import data_updater
-import data_processor
+import etl.data_updater as data_updater
+import etl.data_processor as data_processor
 
 def run_pipeline():
     #显式检测和初始化本地存储的文件夹

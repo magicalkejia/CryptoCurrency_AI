@@ -6,7 +6,9 @@
 data_storage/
 logs/
 
+
 #env file 
 .env
 
 .vscode
+quant_system.egg-info/

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant_system"
+version = "0.1.0"
+# 注意：dependencies (依赖) 也可以放在这里，比如：
+# dependencies = ["pandas", "vectorbt", "numpy"]
+
+[tool.setuptools]
+# 因为系统比较多，直接不同系统按照包模块化管理了
+packages = ["etl", "strategies", "models", "backtest"]
+# 2. 这里放根目录的单文件名字 (Modules)，不需要加 .py 后缀
+py-modules = ["config"]

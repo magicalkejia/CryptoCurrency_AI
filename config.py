@@ -11,8 +11,8 @@ class PathConfig:
     DATA_ROOT = BASE_DIR / 'data_storage'
     BACKTEST_ROOT = BASE_DIR / 'backtest'  #回测
     MODELS_ROOT = BASE_DIR / 'models'   #模型
-    LOGS = BASE_DIR / 'logs'          # 日志
-
+    ETL = BASE_DIR / 'etl'          # 数据处理
+    STRATEGY = BASE_DIR / 'strategies'  #策略
     RAW = DATA_ROOT / 'raw'
     PROCESSED = DATA_ROOT / 'processed'
     MODELS = DATA_ROOT / 'models'     
@@ -34,7 +34,7 @@ class SpiderConfig:
     TIMEOUT = 30000
     RATE_LIMIT = True
     START_TIME = '2021-01-01 00:00:00'
-    print(f"🌐 网络模式: {'代理模式 ' if _enable_proxy else '直连模式'}")
+    # print(f"🌐 网络模式: {'代理模式 ' if _enable_proxy else '直连模式'}")
     
 class TargetConfig:
     """交易标的配置"""
@@ -63,7 +63,7 @@ def init_directories():
         PathConfig.RAW,
         PathConfig.PROCESSED,
         PathConfig.MODELS,
-        PathConfig.LOGS
+        PathConfig.ETL
     ]
     
     for p in paths_to_create:
