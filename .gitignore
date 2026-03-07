@@ -5,8 +5,8 @@
 # Data directories
 data_storage/
 logs/
-
-
+research/
+.venv/
 #env file 
 .env
 

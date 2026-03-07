@@ -5,11 +5,28 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "quant_system"
 version = "0.1.0"
-# 注意：dependencies (依赖) 也可以放在这里，比如：
-# dependencies = ["pandas", "vectorbt", "numpy"]
+dependencies = [
+    "akshare==1.18.35",
+    "baostock==0.8.9",
+    "ccxt==4.5.31",
+    "parquet==1.3.1",
+    "pyarrow", 
+    "duckdb==1.4.4",
+    "numpy==2.4.2",
+    "pandas==3.0.1",
+    "python-dotenv==1.2.2",
+    "tqdm==4.66.4",
+    "vectorbt==0.28.2",
+    "taskipy"
+]
 
 [tool.setuptools]
 # 因为系统比较多，直接不同系统按照包模块化管理了
 packages = ["etl", "strategies", "models", "backtest"]
 # 2. 这里放根目录的单文件名字 (Modules)，不需要加 .py 后缀
 py-modules = ["config"]
+
+[tool.taskipy.tasks]
+sysrun = "pip install -e ."
+dataupdate = "python etl/data_updater.py"
+clean = "for /d /r . %d in (__pycache__) do @if exist \"%d\" rd /s /q \"%d\""

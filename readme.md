@@ -21,11 +21,33 @@ Quant_System/
 
 ├── config.py      #各种配置
 
-引入了pyproject.toml 做python 项目管理，这样跨层级引用文件就不容易出乱七八糟的问题，我受够了os 写绝对路径了
+如何使用：
 
-pip install -e .
+首先构造一个虚拟环境防止污染
+
+```
+python -m venv .venv
+```
+
+引入了pyproject.toml 做python 项目管理，这样跨层级引用文件就不容易出乱七八糟的问题，我受够了os 写绝对路径
+
+需要看到终端控制台提示绿色字符知道进入虚拟环境，如果没有
+
+```
+.\.venv\Scripts\activate
+```
+然后项目根目录终端输入
+```
+pip install -e .   
+```
 
 就可以用了，如果还有config.py这样希望全局引用的文件可以去修改pyproject.toml
+
+用于云服务器时，不需要可编辑，省略e
+
+```
+pip install .
+```
 
 pipreqs ./ --encoding=utf8 --force    （新装的包可以用这个更新requirements.txt)
 

@@ -13,9 +13,12 @@ class PathConfig:
     MODELS_ROOT = BASE_DIR / 'models'   #模型
     ETL = BASE_DIR / 'etl'          # 数据处理
     STRATEGY = BASE_DIR / 'strategies'  #策略
-    RAW = DATA_ROOT / 'raw'
-    PROCESSED = DATA_ROOT / 'processed'
-    MODELS = DATA_ROOT / 'models'     
+    LOG = BASE_DIR / 'logs'  #日志
+
+    RAW = DATA_ROOT / 'raw'  #加密货币原始行情数据
+    PROCESSED = DATA_ROOT / 'processed'  #处理过的加密货币或者别的数据
+    MODELS = DATA_ROOT / 'models'    #模型
+    META = DATA_ROOT / 'meta'  # 用于存放静态标的池等元数据
 
 class SpiderConfig:
     """爬虫相关配置"""
@@ -59,11 +62,12 @@ def init_directories():
         PathConfig.DATA_ROOT,
         PathConfig.BACKTEST_ROOT,
         PathConfig.MODELS_ROOT,
-
+        PathConfig.LOG,
         PathConfig.RAW,
         PathConfig.PROCESSED,
         PathConfig.MODELS,
-        PathConfig.ETL
+        PathConfig.ETL,
+        PathConfig.META
     ]
     
     for p in paths_to_create:
