@@ -155,4 +155,4 @@ def resample_data(df_1m, symbol):
             print(f"   -> Generated: {timeframe} ({len(df_resampled)} rows)")
             
         except Exception as e:
-            print(f"   ❌ Error resampling {timeframe}: {e}")
+            print(f"  ❌ Error resampling {timeframe}: {e}")

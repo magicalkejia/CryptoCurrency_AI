@@ -12,3 +12,4 @@ research/
 
 .vscode
 quant_system.egg-info/
+ipynb_checkpoints/
