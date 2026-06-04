@@ -1,19 +1,28 @@
-# Python caches & venv
+# Python caches
+__pycache__/
 **/__pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+
 # Jupyter
-.ipynb_checkpoints
-ipynb_checkpoints/
-# Data directories
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Data / outputs
 data_storage/
 logs/
 research/
-#env file 
+
+# Environment
 .venv/
 venv/
 env/
+.env
+.env.*
+
+# IDE
 .idea/
-.vscode
+.vscode/
+
+# Build / package
 quant_system.egg-info/
