@@ -8,7 +8,6 @@ from etl.data_loader import DataLoader
 def calc_jump_penalty_vectorized(open_price: pd.DataFrame, close_price: pd.DataFrame, window: int = 30) -> pd.DataFrame:
     """
      隔夜跳空惩罚因子
-    输入 7500x2500 的宽表，瞬间返回结果
     """
     # 1. 严格对齐你之前的数学逻辑：|当日开盘 / 昨收 - 1|
     jump_pct = (open_price / close_price.shift(1) - 1).abs()
@@ -49,7 +48,7 @@ def calc_momentum_r2_vectorized(close_price: pd.DataFrame, window: int = 25) -> 
     C = (weights * (x - x_w_mean)) / denominator
     
     # --- 2. 使用高效的滑动窗口点积代替 Polyfit ---
-    # 定义一个内部闭包供 rolling 使用（Numpy 引擎，极速）
+    # 定义一个内部闭包供 rolling 使用（Numpy 引擎）
     def fast_slope(y_array):
         if np.isnan(y_array).any(): return np.nan
         # 核心：Y 与常数向量 C 的点积直接得出线性回归斜率！

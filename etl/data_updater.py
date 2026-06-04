@@ -54,6 +54,8 @@ def fetch_data(symbol):
     print(f" 开始抓取 {symbol}...")
     
     while True:
+        retry_count = 0
+        max_retry = 5
         try:
             klines = exchange.fapiPublicGetKlines({
                 'symbol': symbol_clean,
@@ -79,12 +81,15 @@ def fetch_data(symbol):
             if len(new_data) % 15000 < 1500:
                 curr_date = datetime.fromtimestamp(last_ts_ms / 1000)
                 print(f"   ⏳ 进度: {curr_date} | 本次新增: {len(new_data)} 行")
-            
+            retry_count = 0
             if last_ts_ms >= now - 120000: break
             time.sleep(0.1) 
 
         except Exception as e:
-            print(f"   ❌ 网络错误: {e}")
+            retry_count += 1
+            print(f"❌ 网络错误 {retry_count}/{max_retry}: {e}")
+            if retry_count >= max_retry:
+                return False
             time.sleep(5)
             continue
 
@@ -183,7 +188,7 @@ def update_instrument_master():
     print(f"✅ 基表 更新完毕 系统总标的数: {len(df_final)}")
     return df_final
 
-def update_daily_cross_section():
+def fetch_realtime_snapshot(save=False):
     """实时截面由于精度要求不高（仅作最新状态获取），可保留东财接口"""
     today_str = datetime.now().strftime('%Y%m%d')
     print(f"\n========================================")
@@ -219,9 +224,9 @@ def update_daily_cross_section():
     for col in ['Close', 'High', 'Low', 'Volume', 'Amount']:
         df_daily[col] = pd.to_numeric(df_daily[col], errors='coerce')
         
-    os.makedirs(cross_section_path.parent, exist_ok=True)
-    df_daily.to_parquet(cross_section_path, engine='pyarrow', compression='zstd')
-    print(f"💾 截面数据已保存至: {cross_section_path}")
+    if save:
+        df_daily.to_parquet(config.PathConfig.CROSS_SECTION / "latest.parquet")
+    return df_daily
 
 # =====================================================================
 # 模块二：A股历史数据 - 新浪与 Baostock 兼用
@@ -353,7 +358,6 @@ def update_all_history_data(global_start_date = "1990-12-19"):
     bs.login()
     today_str = datetime.now().strftime('%Y-%m-%d')
     
-    # 细化失败记录
     failed_symbols_exception = [] 
     failed_symbols_empty = []
     
@@ -374,7 +378,6 @@ def update_all_history_data(global_start_date = "1990-12-19"):
             else:
                 start_date = global_start_date
                 
-            # --- 传入路由核心 ---
             df_new = fetch_symbol_history(item['BsCode'], suffix_code, start_date, today_str, item['AssetType'])
             
             # 如果返回空表，检查区别 真的污染还是别的问题

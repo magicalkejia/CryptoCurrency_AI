@@ -29,5 +29,8 @@ py-modules = ["config"]
 
 [tool.taskipy.tasks]
 sysrun = "pip install -e ."
-dataupdate = "python etl/data_updater.py"
+crypto = "python main.py --mode crypto"
+stock = "python main.py --mode stock"
+all = "python main.py --mode all"
+dataupdate = "python main.py --mode crypto"
 clean = "for /d /r . %d in (__pycache__) do @if exist \"%d\" rd /s /q \"%d\""

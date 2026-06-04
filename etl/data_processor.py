@@ -101,7 +101,7 @@ def clean_single_file(symbol):
             
         # Ensure directory exists
         ##os.makedirs(output_path.parent, exist_ok=True)
-        
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(output_path, engine='pyarrow', compression='zstd', index=False)
         print(f"   💾 Saved Processed Data")
         
@@ -113,7 +113,7 @@ def clean_single_file(symbol):
         traceback.print_exc()
         return None
 
-def resample_data(df_1m, symbol):
+def resample_data(df_1m, symbol,drop_last_incomplete=True):
     """
     Resamples 1m data to 1h, 4h, 1d based on Config
     """

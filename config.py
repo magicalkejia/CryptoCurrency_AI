@@ -20,6 +20,13 @@ class PathConfig:
     MODELS = DATA_ROOT / 'models'    #模型
     META = DATA_ROOT / 'meta'  # 用于存放静态标的池等元数据
 
+    CROSS_SECTION = DATA_ROOT / 'cross_section'
+    HISTORY_K = DATA_ROOT / 'history_k'
+    FACTORS = DATA_ROOT / 'factors'
+    SIGNALS = DATA_ROOT / 'signals'
+    BACKTEST_RESULTS = DATA_ROOT / 'backtest_results'
+    EXPERIMENTS = DATA_ROOT / 'experiments'
+    
 class SpiderConfig:
     """爬虫相关配置"""
     # 1. 读取开关 (默认为 false)
