@@ -70,11 +70,18 @@ def init_directories():
         PathConfig.BACKTEST_ROOT,
         PathConfig.MODELS_ROOT,
         PathConfig.LOG,
+
         PathConfig.RAW,
         PathConfig.PROCESSED,
         PathConfig.MODELS,
-        PathConfig.ETL,
-        PathConfig.META
+        PathConfig.META,
+
+        PathConfig.CROSS_SECTION,
+        PathConfig.HISTORY_K,
+        PathConfig.FACTORS,
+        PathConfig.SIGNALS,
+        PathConfig.BACKTEST_RESULTS,
+        PathConfig.EXPERIMENTS,
     ]
     
     for p in paths_to_create:

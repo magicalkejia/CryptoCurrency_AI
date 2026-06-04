@@ -9,7 +9,39 @@ from tqdm import tqdm
 import baostock as bs
 import numpy as np
 import traceback
+##工具函数
+def merge_incremental_data(
+    df_old: pd.DataFrame | None,
+    df_new: pd.DataFrame,
+    key_col: str,
+) -> pd.DataFrame:
+    """
+    合并旧数据和增量数据。
+    设计原则：
+    - 默认相信旧数据和新数据都是按 key_col 升序；
+    - 先 concat + drop_duplicates；
+    - 只有发现非单调时才排序；
+    - 保留最新数据，即 keep='last'。
+    """
+    if df_new is None or df_new.empty:
+        return df_old if df_old is not None else pd.DataFrame()
 
+    if not df_new[key_col].is_monotonic_increasing:
+        df_new = df_new.sort_values(key_col).reset_index(drop=True)
+
+    if df_old is None or df_old.empty:
+        return df_new.reset_index(drop=True)
+
+    if not df_old[key_col].is_monotonic_increasing:
+        df_old = df_old.sort_values(key_col).reset_index(drop=True)
+
+    df_final = pd.concat([df_old, df_new], ignore_index=True)
+    df_final = df_final.drop_duplicates(subset=[key_col], keep="last")
+
+    if not df_final[key_col].is_monotonic_increasing:
+        df_final = df_final.sort_values(key_col)
+
+    return df_final.reset_index(drop=True)
 # =====================================================================
 # Crypto 数据采集 
 # =====================================================================
@@ -52,10 +84,10 @@ def fetch_data(symbol):
     new_data = []
     now = exchange.milliseconds()
     print(f" 开始抓取 {symbol}...")
-    
+    retry_count = 0
+    max_retry = 5
     while True:
-        retry_count = 0
-        max_retry = 5
+
         try:
             klines = exchange.fapiPublicGetKlines({
                 'symbol': symbol_clean,
@@ -94,19 +126,58 @@ def fetch_data(symbol):
             continue
 
     if new_data:
-        df_new = pd.DataFrame(new_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'taker_buy_vol'])
-        df_new['timestamp'] = pd.to_datetime(df_new['timestamp'], unit='ms')
-        
+        df_new = pd.DataFrame(
+            new_data,
+            columns=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "taker_buy_vol",
+            ],
+        )
+        df_new["timestamp"] = pd.to_datetime(df_new["timestamp"], unit="ms")
+
+        # API 正常情况下返回有序，但这里做轻量防御
+        if not df_new["timestamp"].is_monotonic_increasing:
+            df_new = df_new.sort_values("timestamp").reset_index(drop=True)
+
         if os.path.exists(file_path):
             df_old = pd.read_parquet(file_path)
+
+            # 如果旧文件本身乱序，先修一次
+            if not df_old["timestamp"].is_monotonic_increasing:
+                print(f"⚠️ 旧文件时间戳乱序，执行一次排序修复: {file_path}")
+                df_old = df_old.sort_values("timestamp").reset_index(drop=True)
+
             df_final = pd.concat([df_old, df_new], ignore_index=True)
-            df_final = df_final.drop_duplicates(subset=['timestamp'], keep='last')
+            df_final = df_final.drop_duplicates(subset=["timestamp"], keep="last")
+
+            # 正常增量不需要排序；只有发现异常才排序
+            if not df_final["timestamp"].is_monotonic_increasing:
+                print(f"⚠️ 合并后时间戳乱序，执行排序修复: {symbol}")
+                df_final = df_final.sort_values("timestamp").reset_index(drop=True)
+            else:
+                df_final = df_final.reset_index(drop=True)
+
         else:
-            df_final = df_new
-            
-        df_final.to_parquet(file_path, engine='pyarrow', compression='zstd', index=False)
+            df_final = df_new.reset_index(drop=True)
+
+        # 轻量防御：不依赖调用方一定先 init_directories
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        df_final.to_parquet(
+            file_path,
+            engine="pyarrow",
+            compression="zstd",
+            index=False,
+        )
+
         print(f"💾 {symbol} 写入完成，共包含 {len(df_final)} 行数据")
-        return True 
+        return True
+
     else:
         print(f"✅ {symbol} 已是最新，无需更新")
         return False
@@ -369,7 +440,8 @@ def update_all_history_data(global_start_date = "1990-12-19"):
             last_date = None
             if os.path.exists(file_path):
                 try:
-                    last_date = pd.to_datetime(pd.read_parquet(file_path, columns=['date'])['date'].iloc[-1])
+                    date_series = pd.to_datetime(pd.read_parquet(file_path, columns=["date"])["date"])
+                    last_date = date_series.max()
                 except: pass
                 
             if last_date:
@@ -410,11 +482,16 @@ def update_all_history_data(global_start_date = "1990-12-19"):
             
             if last_date and os.path.exists(file_path):
                 df_old = pd.read_parquet(file_path)
-                df_final = pd.concat([df_old, df_new], ignore_index=True).drop_duplicates(subset=['date'], keep='last')
             else:
-                df_final = df_new
-                
-            df_final.to_parquet(file_path, engine='pyarrow', compression='zstd')
+                df_old = None
+
+            df_final = merge_incremental_data(
+                df_old=df_old,
+                df_new=df_new,
+                key_col="date",
+            )
+
+            df_final.to_parquet(file_path, engine="pyarrow", compression="zstd", index=False)
             
         except Exception as e:
             print(f"\n❌ [异常报错] {suffix_code} 拉取失败: {str(e)}")

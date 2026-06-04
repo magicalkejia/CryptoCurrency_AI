@@ -8,14 +8,22 @@ def run_pipeline(mode: str):
     config.init_directories()
 
     if mode == "crypto":
-        run_crypto_pipeline()
+        result = run_crypto_pipeline()
+        print(result)
+        return result
+
     elif mode == "stock":
-        run_stock_pipeline()
+        result = run_stock_pipeline()
+        return result
+
     elif mode == "all":
-        run_stock_pipeline()
-        run_crypto_pipeline()
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
+        stock_result = run_stock_pipeline()
+        crypto_result = run_crypto_pipeline()
+        print(crypto_result)
+        return {
+            "stock": stock_result,
+            "crypto": crypto_result,
+        }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

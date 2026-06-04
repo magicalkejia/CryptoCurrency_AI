@@ -46,7 +46,9 @@ def clean_single_file(symbol):
     
     try:
         df = pd.read_parquet(input_path, engine='pyarrow')
-        
+        if df.empty:
+            print(f"⚠️ Empty raw file: {input_path}")
+            return None
         # --- A. Deduplication ---
         df = df.drop_duplicates(subset=['timestamp'], keep='first')
         
@@ -144,6 +146,8 @@ def resample_data(df_1m, symbol,drop_last_incomplete=True):
             
             # Drop NaN (usually at the start)
             df_resampled = df_resampled.dropna()
+            if drop_last_incomplete and len(df_resampled) > 0:
+                 df_resampled = df_resampled.iloc[:-1]
 
             # Save
             symbol_clean = symbol.replace('/', '')
@@ -151,7 +155,12 @@ def resample_data(df_1m, symbol,drop_last_incomplete=True):
             save_path = config.PathConfig.PROCESSED / save_name
             
             df_resampled = df_resampled.reset_index()
-            df_resampled.to_parquet(save_path, engine='pyarrow', compression='zstd')
+            df_resampled.to_parquet(
+                save_path,
+                engine="pyarrow",
+                compression="zstd",
+                index=False,
+            )
             print(f"   -> Generated: {timeframe} ({len(df_resampled)} rows)")
             
         except Exception as e:
