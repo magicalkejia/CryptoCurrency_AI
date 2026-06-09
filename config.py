@@ -21,7 +21,7 @@ class PathConfig:
     META = DATA_ROOT / 'meta'  # 用于存放静态标的池等元数据
 
     CROSS_SECTION = DATA_ROOT / 'cross_section'
-    HISTORY_K = DATA_ROOT / 'history_k'
+    # HISTORY_K = DATA_ROOT / 'history_k'
     FACTORS = DATA_ROOT / 'factors'
     SIGNALS = DATA_ROOT / 'signals'
     BACKTEST_RESULTS = DATA_ROOT / 'backtest_results'
@@ -44,7 +44,7 @@ class SpiderConfig:
     TIMEOUT = 30000
     RATE_LIMIT = True
     START_TIME = '2021-01-01 00:00:00'
-    # print(f"🌐 网络模式: {'代理模式 ' if _enable_proxy else '直连模式'}")
+    # print(f" 网络模式: {'代理模式 ' if _enable_proxy else '直连模式'}")
     
 class TargetConfig:
     """交易标的配置"""
@@ -90,6 +90,6 @@ def init_directories():
             # exist_ok=True 表示如果文件夹已存在就不报错
             # parents=True 表示如果父目录不存在也一并创建 (比如先建 data_storage 再建 raw)
             os.makedirs(p, exist_ok=True)
-            print(f"✅ 目录检查/创建成功: {p}")
+            print(f" 目录检查/创建成功: {p}")
         except Exception as e:
-            print(f"❌ 目录创建失败 {p}: {e}")
+            print(f"目录创建失败 {p}: {e}")
