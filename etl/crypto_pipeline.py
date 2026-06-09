@@ -25,6 +25,6 @@ def run_crypto_pipeline():
             "resample": ok_resample,
         })
 
-        df_result = pd.DataFrame(results)
-        print(df_result)
-        return df_result
+    df_result = pd.DataFrame(results)
+    print(df_result)
+    return df_result

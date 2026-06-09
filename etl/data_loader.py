@@ -17,25 +17,193 @@ class DataLoader:
         self.a_share_cross_dir = Path(config.PathConfig.DATA_ROOT) / 'cross_section'
         self.a_share_history_dir = Path(config.PathConfig.DATA_ROOT) / 'history_k'
 
-    # =====================================================================
+    #region
     # 模块一：A 股数据接口
-    # =====================================================================
-    def get_instrument_master(self, asset_type=None, status='active', include_st=False):
-        """获取 A 股基表"""
-        master_path = self.a_share_meta_dir / 'instrument_master.parquet'
+    #endregion
+    def get_instrument_master(
+        self,
+        asset_type=None,
+        status="all",
+        include_st=True,
+        keyword=None,
+        only_with_history=False,
+        sort_by=None,
+    ):
+        """
+        获取 A股 / ETF / 指数基表。
+
+        设计原则：
+        - 默认 status="all"，避免因为 active/delisted 状态口径导致查不到
+        - 默认 only_with_history=False，先查基表，再决定是否要求本地历史数据
+        - asset_type 支持单值、列表、别名、all
+        - keyword 支持代码 / 简称 / suffix 模糊搜索
+        """
+        master_path = self.a_share_meta_dir / "instrument_master.parquet"
+
         if not master_path.exists():
-            print("⚠️ A股基表不存在")
+            print("⚠️ A股基表不存在，请先运行 update_instrument_master()")
             return pd.DataFrame()
 
-        query = f"SELECT * FROM read_parquet('{master_path}') WHERE 1=1"
-        if status != 'all':
-            query += f" AND Status = '{status}'"
-        if asset_type:
-            query += f" AND AssetType = '{asset_type}'"
-        if not include_st:
-            query += " AND StockAbbreviation NOT LIKE '%ST%' AND StockAbbreviation NOT LIKE '%退%'"
-            
-        return self.conn.execute(query).df()
+        df = pd.read_parquet(master_path).copy()
+
+        # 基础字段标准化，避免大小写/空格导致筛不到
+        for col in ["AssetType", "Status", "StockCode", "SuffixStockNum", "StockAbbreviation"]:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.strip()
+
+        if "AssetType" in df.columns:
+            df["AssetType"] = df["AssetType"].str.lower()
+
+        if "Status" in df.columns:
+            df["Status"] = df["Status"].str.lower()
+
+        # 标记本地是否已有 history_k 文件
+        history_files = {p.stem for p in self.a_share_history_dir.glob("*.parquet")}
+        if "SuffixStockNum" in df.columns:
+            df["HasHistory"] = df["SuffixStockNum"].isin(history_files)
+        else:
+            df["HasHistory"] = False
+
+        # 资产类型别名
+        asset_alias = {
+            None: None,
+            "all": None,
+            "market": ["stock", "etf", "index"],
+            "tradable": ["stock", "etf"],
+            "stocks": ["stock"],
+            "stock": ["stock"],
+            "etfs": ["etf"],
+            "etf": ["etf"],
+            "fund": ["etf"],
+            "index": ["index"],
+            "idx": ["index"],
+        }
+
+        if isinstance(asset_type, str):
+            asset_type = asset_alias.get(asset_type.lower(), [asset_type.lower()])
+        elif isinstance(asset_type, (list, tuple, set)):
+            asset_type = [str(x).lower() for x in asset_type]
+
+        if asset_type is not None and "AssetType" in df.columns:
+            df = df[df["AssetType"].isin(asset_type)].copy()
+
+        # 状态别名
+        status_alias = {
+            None: "all",
+            "all": "all",
+            "active": ["active"],
+            "listed": ["active"],
+            "list": ["active"],
+            "上市": ["active"],
+            "delisted": ["delisted"],
+            "delist": ["delisted"],
+            "退市": ["delisted"],
+        }
+
+        if isinstance(status, str):
+            status_key = status.lower()
+            status = status_alias.get(status_key, [status_key])
+        elif isinstance(status, (list, tuple, set)):
+            status = [str(x).lower() for x in status]
+
+        if status != "all" and "Status" in df.columns:
+            df = df[df["Status"].isin(status)].copy()
+
+        # ST / 退过滤
+        if not include_st and "StockAbbreviation" in df.columns:
+            df = df[
+                ~df["StockAbbreviation"].astype(str).str.contains("ST|退", case=False, na=False)
+            ].copy()
+
+        # 是否只看本地已有历史数据
+        if only_with_history:
+            df = df[df["HasHistory"]].copy()
+
+        # 关键词搜索
+        if keyword:
+            keyword = str(keyword).strip()
+            mask = pd.Series(False, index=df.index)
+
+            search_cols = [
+                "SuffixStockNum",
+                "StockCode",
+                "SinaCode",
+                "StockAbbreviation",
+                "AssetType",
+                "Status",
+            ]
+
+            for col in search_cols:
+                if col in df.columns:
+                    mask = mask | df[col].astype(str).str.contains(keyword, case=False, na=False)
+
+            df = df[mask].copy()
+
+        # 列顺序
+        preferred_cols = [
+            "SuffixStockNum",
+            "StockCode",
+            "SinaCode",
+            "StockAbbreviation",
+            "AssetType",
+            "Status",
+            "ListingDate",
+            "DelistingDate",
+            "HasHistory",
+        ]
+
+        preferred_cols = [c for c in preferred_cols if c in df.columns]
+        other_cols = [c for c in df.columns if c not in preferred_cols]
+        df = df[preferred_cols + other_cols]
+
+        # 排序
+        if sort_by and sort_by in df.columns:
+            df = df.sort_values(sort_by)
+        else:
+            sort_cols = [c for c in ["AssetType", "StockCode", "SuffixStockNum"] if c in df.columns]
+            if sort_cols:
+                df = df.sort_values(sort_cols)
+
+        return df.reset_index(drop=True)
+        
+    def list_etf(self, keyword=None, only_with_history=True):
+        return self.get_instrument_master(
+            asset_type="etf",
+            status="active",
+            include_st=True,
+            keyword=keyword,
+            only_with_history=only_with_history,
+        )
+
+
+    def list_stock(self, keyword=None, include_st=True, only_with_history=True):
+        return self.get_instrument_master(
+            asset_type="stock",
+            status="active",
+            include_st=include_st,
+            keyword=keyword,
+            only_with_history=only_with_history,
+        )
+
+
+    def list_index(self, keyword=None, only_with_history=True):
+        return self.get_instrument_master(
+            asset_type="index",
+            status="active",
+            include_st=True,
+            keyword=keyword,
+            only_with_history=only_with_history,
+        )
+
+
+    def list_market(self, keyword=None, status="active", only_with_history=True):
+        return self.get_instrument_master(
+            asset_type="market",
+            status=status,
+            include_st=True,
+            keyword=keyword,
+            only_with_history=only_with_history,
+        )
 
     def get_cross_section(self, date_str, asset_type='stock'):
         """获取 A 股某一日的截面快照"""
@@ -206,6 +374,32 @@ class DataLoader:
             return pd.DataFrame()
         return pd.read_parquet(factor_path)
 
+    def export_local_instrument_catalog(self, output_path=None):
+        """
+        导出本地标的目录，方便用 Excel / WPS / VSCode Data Viewer 查看。
+        """
+        catalog = self.list_local_instruments(
+            asset_type=None,
+            status="all",
+            include_st=True,
+            only_with_history=False,
+        )
+
+        if output_path is None:
+            output_path = self.a_share_meta_dir / "local_instrument_catalog.csv"
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        catalog.to_csv(output_path, index=False, encoding="utf-8-sig")
+
+        parquet_path = output_path.with_suffix(".parquet")
+        catalog.to_parquet(parquet_path, index=False)
+
+        print(f"✅ 已导出本地标的目录: {output_path}")
+        print(f"✅ 已导出 Parquet 版本: {parquet_path}")
+
+        return catalog
     # =====================================================================
     # 模块二：加密货币数据查询接口 
     # =====================================================================
