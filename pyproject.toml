@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quant_system"
-version = "0.1.0"
+version = "0.1.5"
 dependencies = [
     "akshare==1.18.35",
     "baostock==0.8.9",
@@ -18,7 +18,6 @@ dependencies = [
     "tqdm==4.66.4",
     "quantstats",        
     "ipython==8.12.3",
-    "streamlit",
     "taskipy",
     # --- v6 additions ---
     "scikit-learn",
@@ -33,10 +32,7 @@ dependencies = [
 [tool.setuptools]
 # 因为系统比较多，直接不同系统按照包模块化管理了
 packages = ["etl", "strategies", "models", "backtest",
-    "crypto", "crypto.labels", "crypto.features",
-    "crypto.cv", "crypto.benchmark", "crypto.models", "crypto.eval",
-    "crypto.live", "crypto.skills", "crypto.agents", "crypto.orchestration",
-    "crypto.experiments", "crypto.governance"]
+    "crypto","app"]
 # 2. 这里放根目录的单文件名字 (Modules)，不需要加 .py 后缀
 py-modules = ["config"]
 
@@ -47,4 +43,3 @@ stock = "python main.py --mode stock"
 all = "python main.py --mode all"
 dataupdate = "python main.py --mode crypto"
 clean = "for /d /r . %d in (__pycache__) do @if exist \"%d\" rd /s /q \"%d\""
-catalog = "streamlit run app/catalog_app.py"
