@@ -20,11 +20,23 @@ dependencies = [
     "ipython==8.12.3",
     "streamlit",
     "taskipy",
+    # --- v6 additions ---
+    "scikit-learn",
+    "scipy",
+    "lightgbm",   # production learner; crypto falls back to sklearn if absent
+    "pytest",
+    # "torch",    # OPTIONAL: enables real PatchTST; crypto falls back to sklearn temporal model if absent
+    # "langgraph", # OPTIONAL: production agent orchestration; crypto falls back to a builtin state machine if absent
+    "flask",      # web front-end (app/server.py)
 ]
 
 [tool.setuptools]
 # 因为系统比较多，直接不同系统按照包模块化管理了
-packages = ["etl", "strategies", "models", "backtest","app"]
+packages = ["etl", "strategies", "models", "backtest",
+    "crypto", "crypto.labels", "crypto.features",
+    "crypto.cv", "crypto.benchmark", "crypto.models", "crypto.eval",
+    "crypto.live", "crypto.skills", "crypto.agents", "crypto.orchestration",
+    "crypto.experiments", "crypto.governance"]
 # 2. 这里放根目录的单文件名字 (Modules)，不需要加 .py 后缀
 py-modules = ["config"]
 
