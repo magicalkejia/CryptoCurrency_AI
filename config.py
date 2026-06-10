@@ -21,7 +21,6 @@ class PathConfig:
     META = DATA_ROOT / 'meta'  # 用于存放静态标的池等元数据
 
     CROSS_SECTION = DATA_ROOT / 'cross_section'
-    # HISTORY_K = DATA_ROOT / 'history_k'
     FACTORS = DATA_ROOT / 'factors'
     SIGNALS = DATA_ROOT / 'signals'
     BACKTEST_RESULTS = DATA_ROOT / 'backtest_results'
@@ -78,7 +77,6 @@ def init_directories():
         PathConfig.META,
 
         PathConfig.CROSS_SECTION,
-        PathConfig.HISTORY_K,
         PathConfig.FACTORS,
         PathConfig.SIGNALS,
         PathConfig.BACKTEST_RESULTS,

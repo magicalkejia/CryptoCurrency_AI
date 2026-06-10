@@ -95,6 +95,33 @@ def build_trade_records(
     trades = trades[trades["execution_price"] > 0].copy()
 
     trades["side"] = np.where(trades["delta_weight"] > 0, "BUY", "SELL")
+    def classify_trade(row):
+        pre = row["pre_weight"]
+        post = row["post_weight"]
+        delta = row["delta_weight"]
+
+        if pre == 0 and post > 0:
+            return "OPEN_LONG"
+        if pre > 0 and post == 0:
+            return "CLOSE_LONG"
+        if pre > 0 and post > 0:
+            return "INCREASE_LONG" if delta > 0 else "REDUCE_LONG"
+
+        if pre == 0 and post < 0:
+            return "OPEN_SHORT"
+        if pre < 0 and post == 0:
+            return "CLOSE_SHORT"
+        if pre < 0 and post < 0:
+            return "INCREASE_SHORT" if delta < 0 else "REDUCE_SHORT"
+
+        if pre > 0 and post < 0:
+            return "FLIP_LONG_TO_SHORT"
+        if pre < 0 and post > 0:
+            return "FLIP_SHORT_TO_LONG"
+
+        return "UNKNOWN"
+
+    trades["trade_type"] = trades.apply(classify_trade, axis=1)
     trades["trade_amount"] = trades["delta_weight"] * trades["portfolio_value_before_trade"]
     trades["quantity"] = trades["trade_amount"] / trades["execution_price"]
 
@@ -126,6 +153,7 @@ def build_trade_records(
         "signal_date",
         "code",
         "side",
+        "trade_type",
         "execution_price",
         "pre_weight",
         "post_weight",

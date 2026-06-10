@@ -8,37 +8,42 @@ version = "0.1.5"
 dependencies = [
     "ccxt==4.5.31",
     "parquet==1.3.1",
-    "pyarrow", 
+    "pyarrow",
     "duckdb==1.4.4",
-    "numpy==2.4.2",     
-    "pandas==3.0.1",      
+    "numpy==2.4.2",
+    "pandas==3.0.1",
     "python-dotenv==1.2.2",
     "tqdm==4.66.4",
-    "quantstats",        
+    "quantstats",
     "ipython==8.12.3",
     "taskipy",
-    # --- v6 additions ---
+
+    # v6 additions
     "scikit-learn",
     "scipy",
-    "lightgbm",   # production learner; crypto falls back to sklearn if absent
+    "lightgbm",
     "pytest",
-    # "torch",    # OPTIONAL: enables real PatchTST; crypto falls back to sklearn temporal model if absent
-    # "langgraph", # OPTIONAL: production agent orchestration; crypto falls back to a builtin state machine if absent
-    "flask",      # web front-end (app/server.py)
+
+    # optional / future
+    # "torch",
+    # "langgraph",
+    # "flask",
 ]
 
-# 因为系统比较多，直接不同系统按照包模块化管理了
-[tool.setuptools.packages.find]
-include = ["crypto*", "etl*", "backtest*", "strategies*", "models*"]
-exclude = ["tests*", "app*"]
-
-# 2. 这里放根目录的单文件名字 (Modules)，不需要加 .py 后缀
+[tool.setuptools]
 py-modules = ["config"]
+
+[tool.setuptools.packages.find]
+include = ["crypto*", "etl*", "backtest*"]
+exclude = ["tests*", "app*", "examples*", "scripts*"]
+namespaces = false
 
 [tool.taskipy.tasks]
 sysrun = "pip install -e ."
 crypto = "python main.py --mode crypto"
 dataupdate = "python main.py --mode crypto"
+realdata = "python scripts/run_on_real_data.py"
+agent = "python scripts/run_agent.py"
+reference = "python scripts/reference_decision_exporter.py"
+bt_signal = "python scripts/backtest_agent_decisions.py"
 clean = "for /d /r . %d in (__pycache__) do @if exist \"%d\" rd /s /q \"%d\""
-realdata = "python run_on_real_data.py"
-agent = "python run_agent.py"
