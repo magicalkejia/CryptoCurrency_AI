@@ -845,7 +845,7 @@ def build_feature_view(
 # ---------------------------------------------------------------------------
 
 
-AGENT_4H_MARKET_COLUMNS = [
+_4H_MARKET_COLUMNS = [
     "open_4h",
     "high_4h",
     "low_4h",
@@ -860,7 +860,7 @@ AGENT_4H_MARKET_COLUMNS = [
     "volume_z_96h",
 ]
 
-AGENT_4H_MULTITIMEFRAME_COLUMNS = AGENT_4H_MARKET_COLUMNS + [
+_4H_MULTITIMEFRAME_COLUMNS = _4H_MARKET_COLUMNS + [
     "ret_1h",
     "ret_3h",
     "ret_6h",
@@ -879,7 +879,7 @@ AGENT_4H_MULTITIMEFRAME_COLUMNS = AGENT_4H_MARKET_COLUMNS + [
     "drawdown_from_30d_high",
 ]
 
-AGENT_4H_FULL_OPTIONAL_COLUMNS = AGENT_4H_MULTITIMEFRAME_COLUMNS + [
+_4H_FULL_OPTIONAL_COLUMNS = _4H_MULTITIMEFRAME_COLUMNS + [
     "funding_rate",
     "funding_interval_hours",
     "funding_rate_8h_equiv",
