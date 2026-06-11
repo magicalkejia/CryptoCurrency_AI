@@ -45,12 +45,12 @@ namespaces = false
 
 [tool.taskipy.tasks]
 sysrun = "pip install -e ."
-crypto = "python main.py --mode crypto"
-dataupdate = "python main.py --mode crypto"
-realdata = "python run_on_real_data.py"
+marketonly_dataupdate = "python main.py --mode crypto"
+dataupdate =  "python main.py --mode crypto --fetch-derivatives"
+realdata = "python scripts/run_on_real_data.py"
 experiment = "python run_on_real_data.py --symbols BTC/USDT ETH/USDT SOL/USDT BNB/USDT"
 selftest = "python run_on_real_data.py --synthetic"
-agent = "python run_agent.py"
+agent = "python scripts/run_agent.py"
 reference = "python scripts/reference_decision_exporter.py"
 bt_signal = "python scripts/backtest_agent_decisions.py"
 clean = "for /d /r . %d in (__pycache__) do @if exist \"%d\" rd /s /q \"%d\""

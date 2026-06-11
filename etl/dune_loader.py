@@ -14,7 +14,6 @@ Workflow (Dune API v1):
 
 Honest constraints:
   * Dune metrics are typically DAILY -> a slow factor relative to 4h decisions
-    (fine; on-chain is a low-frequency signal by design).
   * availability_lag must cover block finality + Dune refresh latency; default 1d.
   * only pass recomputable metrics into the CORE experiment; the onchain factor
     builder already filters non-recomputable names.
