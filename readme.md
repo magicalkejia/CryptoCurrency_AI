@@ -739,19 +739,13 @@ experiment_demo.py
 Run examples:
 
 ```bash
-python examples/demo.py
 python examples/agent_demo.py
-python examples/incremental_demo.py
-python examples/experiment_demo.py
 ```
 
 If the files are still in the root directory:
 
 ```bash
-python demo.py
 python agent_demo.py
-python incremental_demo.py
-python experiment_demo.py
 ```
 
 Important:

@@ -95,8 +95,6 @@ pip install -e .          # 会带上 scikit-learn/scipy/lightgbm/pytest
 pytest tests/ -q
 python -m tests.run_all     # 不依赖 pytest 的运行器
 
-# 3) 端到端演示(合成数据,验证集成)
-python demo.py
 
 # 4) 接真实数据(在已跑过 ETL、PROCESSED 下有 *_1h.parquet 之后)
 #    用 crypto.adapters.load_crypto_bars(DataLoader(), "BTC/USDT", "1h", ...) 取 bars,
@@ -124,7 +122,6 @@ python -m tests.run_all    # 38 passed
 
 ## 跑一下
 ```bash
-python experiment_demo.py     # A/B/C/D 对比 + PBO + Holdout 冻结 + 预注册
 python -m tests.run_all    # 46 passed
 ```
 

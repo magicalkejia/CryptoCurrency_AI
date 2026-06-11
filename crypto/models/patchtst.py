@@ -38,15 +38,22 @@ except Exception:
 # windowing
 # --------------------------------------------------------------------------- #
 def make_windows(bars_1h: pd.DataFrame, decision_times: pd.DatetimeIndex,
-                 channels: List[str], lookback: int = 96):
+                 channels: List[str], lookback: int = 96, target_close=None):
     """
     Returns (X, target_dict, valid_decision_times).
-    X: [n, lookback, C] standardized per-window; targets: future returns by horizon.
+    X: [n, lookback, C] standardized per-window; targets: future PRICE returns by horizon.
     Right-aligned: window ends at the last 1h bar <= decision_time.
+
+    target_close: RAW price series used for the forward-return targets. Defaults
+    to bars_1h["close"]. The caller may standardise / difference the INPUT
+    channels (good for a transformer), but the forecast TARGET must stay a real
+    forward price return — computing it from a differenced close both divides by
+    zero on flat bars and is not a meaningful target.
     """
     bars = bars_1h.sort_index()
-    close = bars["close"]
     idx = bars.index
+    tclose = (bars["close"] if target_close is None
+              else pd.Series(target_close).reindex(idx)).to_numpy(dtype=float)
     arr = bars[channels].to_numpy(dtype=float)
 
     Xs, tgts, dts = [], {h: [] for h in HORIZONS_H}, []
@@ -55,12 +62,17 @@ def make_windows(bars_1h: pd.DataFrame, decision_times: pd.DatetimeIndex,
         loc = idx.searchsorted(dt, side="right") - 1   # last bar <= dt
         if loc < lookback or loc + max_h >= len(idx):
             continue
+        c0 = tclose[loc]
+        if not np.isfinite(c0) or c0 == 0.0:           # flat/zero/NaN price guard -> no div-by-zero
+            continue
+        future = [tclose[loc + hh] / c0 - 1.0 for hh in HORIZONS_H.values()]
+        if not all(np.isfinite(v) for v in future):    # skip windows with bad forward prices
+            continue
         w = arr[loc - lookback + 1: loc + 1]            # [lookback, C], ends at dt
         mu, sd = w.mean(0), w.std(0) + 1e-9
         Xs.append((w - mu) / sd)
-        c0 = close.iloc[loc]
-        for h, hh in HORIZONS_H.items():
-            tgts[h].append(close.iloc[loc + hh] / c0 - 1.0)
+        for (h, _), fv in zip(HORIZONS_H.items(), future):
+            tgts[h].append(fv)
         dts.append(dt)
     if not Xs:
         return None, None, pd.DatetimeIndex([])
@@ -182,12 +194,13 @@ def run_patchtst(
     """
     channels = channels or [c for c in ["close", "volume", "taker_buy_vol", "net_taker_vol"]
                             if c in bars_1h.columns]
-    # right-aligned channel transforms (returns) to stabilize
+    # right-aligned channel transforms (returns) to stabilize the transformer INPUT
     feat = bars_1h.copy()
+    raw_close = bars_1h["close"]            # keep RAW price for forward-return TARGETS (fix)
     feat["close"] = feat["close"].pct_change().fillna(0)
     if "volume" in feat:
         feat["volume"] = np.log1p(feat["volume"]).diff().fillna(0)
-    X, tgts, dts = make_windows(feat, decision_times, channels, lookback)
+    X, tgts, dts = make_windows(feat, decision_times, channels, lookback, target_close=raw_close)
     if X is None:
         return pd.DataFrame(columns=["symbol", "decision_time"])
 

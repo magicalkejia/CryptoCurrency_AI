@@ -25,10 +25,15 @@ dependencies = [
     "pytest",
 
     # optional / future
-    # "torch",
     # "langgraph",
     # "flask",
 ]
+
+[project.optional-dependencies]
+# Real PatchTST (deep-learning) backend. Without it, PatchTST auto-falls back to
+# the sklearn temporal model and the experiment still runs.
+#   pip install -e ".[dl]"      (CPU torch is fine; GPU later on the school server)
+dl = ["torch>=2.1"]
 
 [tool.setuptools]
 py-modules = ["config"]
@@ -42,8 +47,10 @@ namespaces = false
 sysrun = "pip install -e ."
 crypto = "python main.py --mode crypto"
 dataupdate = "python main.py --mode crypto"
-realdata = "python scripts/run_on_real_data.py"
-agent = "python scripts/run_agent.py"
+realdata = "python run_on_real_data.py"
+experiment = "python run_on_real_data.py --symbols BTC/USDT ETH/USDT SOL/USDT BNB/USDT"
+selftest = "python run_on_real_data.py --synthetic"
+agent = "python run_agent.py"
 reference = "python scripts/reference_decision_exporter.py"
 bt_signal = "python scripts/backtest_agent_decisions.py"
 clean = "for /d /r . %d in (__pycache__) do @if exist \"%d\" rd /s /q \"%d\""
