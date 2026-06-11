@@ -40,8 +40,8 @@ namespaces = false
 
 [tool.taskipy.tasks]
 sysrun = "pip install -e ."
-crypto = "python main.py --mode crypto"
-dataupdate = "python main.py --mode crypto"
+marketonly_dataupdate = "python main.py --mode crypto"
+dataupdate =  "python main.py --mode crypto --fetch-derivatives"
 realdata = "python scripts/run_on_real_data.py"
 agent = "python scripts/run_agent.py"
 reference = "python scripts/reference_decision_exporter.py"
