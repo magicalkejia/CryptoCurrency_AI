@@ -6,6 +6,7 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 import config
+from etl.feature_registry import DEFAULT_MODEL_FEATURE_SET, get_model_feature_columns
 
 
 MODEL_EXCLUDE_COLS = [
@@ -56,13 +57,26 @@ def load_crypto_feature_table(
 def split_model_inputs(
     features: pd.DataFrame,
     feature_columns: Sequence[str] | None = None,
+    feature_set: str = DEFAULT_MODEL_FEATURE_SET,
 ):
     if feature_columns is None:
-        feature_columns = [
-            c for c in features.columns
-            if c not in MODEL_EXCLUDE_COLS
-            and pd.api.types.is_numeric_dtype(features[c])
-        ]
+        feature_columns = get_model_feature_columns(feature_set)
+
+    missing = [c for c in feature_columns if c not in features.columns]
+    if missing:
+        raise KeyError(
+            f"Feature table is missing {len(missing)} columns required by "
+            f"feature_set={feature_set!r}: {missing}"
+        )
+
+    non_numeric = [
+        c for c in feature_columns
+        if not pd.api.types.is_numeric_dtype(features[c])
+    ]
+    if non_numeric:
+        raise TypeError(
+            f"Model feature columns must be numeric; non-numeric columns found: {non_numeric}"
+        )
 
     X = features[list(feature_columns)].replace([np.inf, -np.inf], np.nan)
     meta = features[["symbol", "decision_time"]].copy()
@@ -107,6 +121,7 @@ def load_trading_graph_inputs(
     start_date=None,
     end_date=None,
     feature_columns: Sequence[str] | None = None,
+    feature_set: str = DEFAULT_MODEL_FEATURE_SET,
     dropna: bool = False,
     graph_compat: bool = True,
 ):
@@ -123,10 +138,19 @@ def load_trading_graph_inputs(
         start_date=start_date,
         end_date=end_date,
     )
-    X, _, feature_cols = split_model_inputs(features, feature_columns=feature_columns)
+    X, _, feature_cols = split_model_inputs(
+        features,
+        feature_columns=feature_columns,
+        feature_set=feature_set,
+    )
     if dropna:
         keep = X.notna().all(axis=1)
         features = features.loc[keep].reset_index(drop=True)
     if graph_compat:
         features = add_trading_graph_compat_columns(features)
     return features, feature_cols
+
+if __name__ == "__main__":
+    df = load_crypto_feature_table()
+    X, meta, feature_cols = split_model_inputs(df, feature_set="market_plus_onchain_v1")
+    print(feature_cols)

@@ -6,7 +6,112 @@
 # It lets model/Agent developers inspect what every feature means without
 # reading each builder function. The values are descriptive metadata only;
 # actual calculations are implemented in the builder functions below.
+from __future__ import annotations
+
+from fnmatch import fnmatch
+from typing import Sequence
+
 import pandas as pd
+
+
+MARKET_CORE_FEATURES: list[str] = [
+    # 4h decision-grid market state.
+    "ret_4h",
+    "ret_24h",
+    "ret_96h",
+    "vol_96h",
+    "range_4h",
+    "close_position_in_4h_range",
+    "volume_z_96h",
+    "net_taker_vol_z_96h",
+    # 1h short-term summary merged into the 4h decision grid.
+    "ret_1h",
+    "ret_3h",
+    "ret_6h",
+    "ret_12h",
+    "ret_24h_from_1h",
+    "vol_24h_from_1h",
+    "volume_z_24h_from_1h",
+    "range_6h_from_1h",
+    "net_taker_vol_6h",
+    "net_taker_vol_z_24h_from_1h",
+    # 1d regime context.
+    "ret_7d",
+    "ret_30d",
+    "vol_30d",
+    "daily_ma_gap_7_30",
+    "daily_trend_up",
+    "drawdown_from_30d_high",
+]
+
+
+FUNDING_EXTENSION_FEATURES: list[str] = [
+    "funding_rate_8h_equiv",
+    "funding_rate_chg",
+    "funding_rate_z_30_events",
+]
+
+
+ONCHAIN_EXTENSION_FEATURES: list[str] = [
+    "onchain_defillama_selected_chains_tvl_usd_chg_7d",
+    "onchain_defillama_selected_chains_tvl_usd_z_30d",
+    "onchain_defillama_stablecoin_mcap_usd_chg_7d",
+    "onchain_defillama_stablecoin_mcap_usd_z_30d",
+    "onchain_defillama_dex_volume_usd_chg_7d",
+    "onchain_defillama_fees_usd_z_30d",
+]
+
+
+MODEL_FEATURE_SETS: dict[str, list[str]] = {
+    # Default compact set for about 10k 4h samples. Avoids raw price levels,
+    # raw volume levels and experimental optional-source columns.
+    "market_core_v1": MARKET_CORE_FEATURES,
+    "market_plus_funding_v1": MARKET_CORE_FEATURES + FUNDING_EXTENSION_FEATURES,
+    "market_plus_onchain_v1": MARKET_CORE_FEATURES + ONCHAIN_EXTENSION_FEATURES,
+    "market_plus_funding_onchain_v1": (
+        MARKET_CORE_FEATURES
+        + FUNDING_EXTENSION_FEATURES
+        + ONCHAIN_EXTENSION_FEATURES
+    ),
+}
+
+DEFAULT_MODEL_FEATURE_SET = "market_core_v1"
+
+
+def get_model_feature_columns(feature_set: str = DEFAULT_MODEL_FEATURE_SET) -> list[str]:
+    """Return explicitly approved model feature columns for a named feature set."""
+    if feature_set not in MODEL_FEATURE_SETS:
+        available = ", ".join(sorted(MODEL_FEATURE_SETS))
+        raise KeyError(f"Unknown feature set {feature_set!r}. Available feature sets: {available}")
+    return list(MODEL_FEATURE_SETS[feature_set])
+
+
+def get_model_feature_sets() -> pd.DataFrame:
+    """Return a compact table of named model feature sets and their columns."""
+    rows = []
+    for name, columns in MODEL_FEATURE_SETS.items():
+        rows.append({
+            "feature_set": name,
+            "n_features": len(columns),
+            "features": columns,
+        })
+    return pd.DataFrame(rows)
+
+
+def validate_model_feature_sets(feature_definitions: Sequence[str] | None = None) -> None:
+    """Validate that explicit model feature sets reference documented features."""
+    known = set(feature_definitions or FEATURE_DEFINITIONS)
+    patterns = [name for name in known if "*" in name]
+    missing = {
+        feature
+        for columns in MODEL_FEATURE_SETS.values()
+        for feature in columns
+        if feature not in known and not any(fnmatch(feature, pattern) for pattern in patterns)
+    }
+    if missing:
+        raise ValueError(f"Model feature sets reference undocumented features: {sorted(missing)}")
+
+
 FEATURE_DEFINITIONS: dict[str, dict[str, str]] = {
     # ------------------------------------------------------------------
     # Identity / time grid
