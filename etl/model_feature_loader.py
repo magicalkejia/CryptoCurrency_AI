@@ -21,6 +21,7 @@ MODEL_EXCLUDE_COLS = [
     "cvd_available_time",
     "sentiment_available_time",
     "onchain_available_time",
+    "max_feature_availability_ts",
     "max_feature_available_time",
     "feature_version",
 ]
@@ -67,3 +68,65 @@ def split_model_inputs(
     meta = features[["symbol", "decision_time"]].copy()
 
     return X, meta, list(feature_columns)
+
+
+def add_trading_graph_compat_columns(features: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add in-memory compatibility columns expected by crypto.orchestration.graph.
+
+    The graph/skills layer currently looks for legacy names such as vol_24,
+    mom_z, funding_rate_z, and max_feature_availability_ts. The multimodal
+    feature builder may produce semantically similar but differently named
+    columns. This adapter keeps that contract out of the partner-owned crypto
+    package and does not write these aliases back to parquet.
+    """
+    out = features.copy()
+
+    if "max_feature_availability_ts" not in out.columns and "max_feature_available_time" in out.columns:
+        out["max_feature_availability_ts"] = out["max_feature_available_time"]
+
+    _fill_alias(out, "vol_24", ["vol_96h", "vol_24h_from_1h", "vol_30d"])
+    _fill_alias(out, "mom_z", ["ret_24h", "ret_96h", "ret_24h_from_1h"])
+    _fill_alias(out, "funding_rate_z", ["funding_rate_z_30_events"])
+
+    return out
+
+
+def _fill_alias(df: pd.DataFrame, alias: str, candidates: Sequence[str]) -> None:
+    if alias in df.columns:
+        return
+    for col in candidates:
+        if col in df.columns:
+            df[alias] = df[col]
+            return
+
+
+def load_trading_graph_inputs(
+    feature_path: str | Path | None = None,
+    symbols: Sequence[str] | None = None,
+    start_date=None,
+    end_date=None,
+    feature_columns: Sequence[str] | None = None,
+    dropna: bool = False,
+    graph_compat: bool = True,
+):
+    """
+    Load the final PIT feature table for TradingGraph inference.
+
+    TradingGraph itself does not read parquet. It expects:
+        features: DataFrame with symbol + decision_time + audit columns
+        feature_cols: numeric model columns used by the fitted ModelBundle
+    """
+    features = load_crypto_feature_table(
+        feature_path=feature_path,
+        symbols=symbols,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    X, _, feature_cols = split_model_inputs(features, feature_columns=feature_columns)
+    if dropna:
+        keep = X.notna().all(axis=1)
+        features = features.loc[keep].reset_index(drop=True)
+    if graph_compat:
+        features = add_trading_graph_compat_columns(features)
+    return features, feature_cols

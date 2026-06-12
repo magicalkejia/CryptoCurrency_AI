@@ -26,3 +26,6 @@ env/
 
 # Build / package
 quant_system.egg-info/
+
+#Ohters
+tests/
