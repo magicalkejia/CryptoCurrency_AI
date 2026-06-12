@@ -13,7 +13,7 @@ parquet, honouring the intended multi-timeframe contract:
 
 This module does NOT re-implement any methodology. It REUSES the project's own
 functions (`to_bars_schema`, `decision_time_grid`, `compute_triple_barrier`,
-`run_patchtst`, `load_funding`, `funding_features`, `average_uniqueness`,
+`run_patchtst`, funding loaders, `funding_features`, `average_uniqueness`,
 `make_supervised_dataset`, `audit_lookahead`) and only wires them together with
 the multi-timeframe market features. On-chain / narrative modalities are left as
 empty hooks (a colleague is producing that data; the pipeline degrades
@@ -40,15 +40,15 @@ import config
 from crypto.adapters import to_bars_schema, decision_time_grid
 from crypto.labels.triple_barrier import compute_triple_barrier
 from crypto.features.uniqueness import average_uniqueness
-from crypto.features.derivatives import load_funding, funding_features
+from crypto.features.derivatives import funding_features
 from crypto.models.patchtst import run_patchtst
 from crypto.pit import make_supervised_dataset, audit_lookahead
 
 # 4h "main" core features — kept identical to the original demos so prior results
 # remain comparable after the migration to real data.
-CORE_4H_COLS = ["ret_1", "ret_6", "ret_24", "vol_24", "mom_z"]
+CORE_4H_COLS = ["ret_1", "ret_6", "ret_24", "vol_24", "mom_z", "range_4h", "close_pos_4h", "volume_z_4h"]
 AUX_1H_COLS = ["h1_ret_24", "h1_vol_24", "h1_rsi_14"]
-ENV_1D_COLS = ["d1_trend_20", "d1_ret_5", "d1_vol_20"]
+ENV_1D_COLS = ["d1_trend_20", "d1_ret_5", "d1_vol_20", "d1_drawdown_30"]
 # order-flow factors derived from taker_buy_vol / net_taker_vol (data you already
 # have but were only fed to PatchTST channels — now PIT tabular market features).
 FLOW_COLS = ["of_buy_frac", "of_net_z", "of_buy_frac_chg"]
@@ -100,6 +100,19 @@ def build_symbol_features(bars_4h: pd.DataFrame, bars_1h: pd.DataFrame,
     f["vol_24"] = c4.pct_change().rolling(24).std()
     m = c4.pct_change(12)
     f["mom_z"] = (m - m.rolling(48).mean()) / (m.rolling(48).std() + 1e-9)
+    # adopted from teammate's builder (stationary, right-aligned): bar structure + participation
+    h4, l4 = bars_4h.get("high"), bars_4h.get("low")
+    if h4 is not None and l4 is not None:
+        f["range_4h"] = (h4 - l4) / c4.replace(0, np.nan)
+        f["close_pos_4h"] = (c4 - l4) / (h4 - l4).replace(0, np.nan)   # close position in bar range
+    else:
+        f["range_4h"] = np.nan
+        f["close_pos_4h"] = np.nan
+    if "volume" in bars_4h.columns:
+        v4 = bars_4h["volume"]
+        f["volume_z_4h"] = (v4 - v4.rolling(24, min_periods=6).mean()) / (v4.rolling(24, min_periods=6).std() + 1e-12)
+    else:
+        f["volume_z_4h"] = np.nan
     f = f.reset_index().rename(columns={"index": "ts_open"})
     # decision_times is already (4h close + offset), one per 4h bar, same order.
     f["decision_time"] = np.asarray(decision_times)[: len(f)]
@@ -122,6 +135,7 @@ def build_symbol_features(bars_4h: pd.DataFrame, bars_1h: pd.DataFrame,
         env["d1_trend_20"] = cd / cd.rolling(20, min_periods=20).mean() - 1.0
         env["d1_ret_5"] = cd.pct_change(5)
         env["d1_vol_20"] = cd.pct_change().rolling(20, min_periods=20).std() * np.sqrt(365)
+        env["d1_drawdown_30"] = cd / cd.rolling(30, min_periods=20).max() - 1.0   # drawdown from 30d high
         env_aligned = _asof_align(env, "1d", pd.DatetimeIndex(f["decision_time"]))
         for col in ENV_1D_COLS:
             f[col] = env_aligned[col].values
@@ -166,6 +180,29 @@ def _read_parquet_bars(processed_dir, symbol: str, timeframe: str) -> Optional[p
         df = df.set_index(pd.to_datetime(df["timestamp"])).sort_index()
         df = df.loc[:, [c for c in df.columns if c != "timestamp"]]
     return df
+
+
+def _load_funding_series(processed_dir, symbol: str) -> Optional[pd.Series]:
+    """Funding-rate Series indexed by settlement time, PIT-clean.
+    Supports BOTH the consolidated file the derivatives team writes
+    (`processed/derivatives/funding.parquet`, with a `symbol` column) and the
+    legacy per-symbol `{SYMBOL}_funding.parquet`. Returns None if absent."""
+    sym = symbol.replace("/", "")
+    p_new = Path(processed_dir) / "derivatives" / "funding.parquet"
+    if p_new.exists():
+        try:
+            df = pd.read_parquet(p_new)
+            if "symbol" in df.columns:
+                df = df[df["symbol"].astype(str).str.replace("/", "") == sym]
+            if not df.empty and {"timestamp", "funding_rate"}.issubset(df.columns):
+                return df.set_index(pd.to_datetime(df["timestamp"]))["funding_rate"].sort_index()
+        except Exception:
+            pass
+    p_old = Path(processed_dir) / f"{sym}_funding.parquet"
+    if p_old.exists():
+        df = pd.read_parquet(p_old)
+        return df.set_index("timestamp")["funding_rate"].sort_index()
+    return None
 
 
 def load_symbol_bars(symbol: str, timeframe: str, processed_dir, loader=None) -> Optional[pd.DataFrame]:
@@ -225,7 +262,7 @@ def build_market_dataset(symbols: List[str], fcfg, processed_dir=None, loader=No
             continue
 
         dts = decision_time_grid(bars_4h, fcfg.decision_offset_minutes)
-        funding = load_funding(processed_dir, sym) if processed_dir else None
+        funding = _load_funding_series(processed_dir, sym) if processed_dir else None
 
         labels = compute_triple_barrier(
             bars_1h, dts, sym, fcfg.label, fcfg.cost, funding=funding,

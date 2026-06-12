@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -210,6 +211,104 @@ def _write_report(outdir, stamp, fcfg, md, ladder, ablation, pbo, diag, checks, 
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
+def _split_cut(ds, holdout_frac):
+    dt = ds["decision_time"].sort_values().reset_index(drop=True)
+    return dt.iloc[int(len(dt) * (1 - holdout_frac))]
+
+
+def _run_holdout(md, cut, fcfg, outdir, args):
+    """FINAL TEST — run the frozen Holdout-A exactly once.
+
+    Train ONE alpha model on the development period (everything before `cut`),
+    then predict the untouched holdout (>= cut) and score it. This consumes
+    Holdout-A; per v6 §6.4 it must be run a single time, with frozen config.
+    """
+    from crypto.models.base_lgb import MultiClassLearner
+    from crypto.benchmark.tsmom import vol_parity_tsmom_weights
+    from backtest.engine import run_vector_backtest, BacktestConfig
+    from crypto.eval.significance import deflated_sharpe_ratio, information_coefficient
+
+    ds = md.dataset
+    feat = md.feature_cols
+    dev = ds[ds["decision_time"] < cut].reset_index(drop=True)
+    hold = ds[ds["decision_time"] >= cut].reset_index(drop=True)
+    if len(hold) < 20:
+        print("    holdout too small — abort."); return
+
+    m = MultiClassLearner(fcfg.model).fit(dev[feat].to_numpy(float),
+                                          dev["tb_label"].to_numpy(int),
+                                          dev["uniqueness_weight"].fillna(1.0).to_numpy(float))
+    pdn, pne, pup = m.predict_proba_df(hold[feat].to_numpy(float))
+    alpha = pup - pdn
+
+    fee = fcfg.cost.fee_bps / 1e4
+    slip = (fcfg.cost.base_slippage_bps + fcfg.cost.spread_proxy_bps) / 1e4
+    cfg = BacktestConfig(fee_rate=fee, slippage_rate=slip, execution_lag=1, annual_days=BARS_PER_YEAR_4H)
+
+    def _port(raw_w):   # same LOW-TURNOVER deployment as the dev ladder
+        tmp = hold[["symbol", "decision_time"]].copy(); tmp["w"] = raw_w
+        wp = tmp.pivot_table(index="decision_time", columns="symbol", values="w", aggfunc="last").fillna(0)
+        if args.smooth_bars and args.smooth_bars > 1:
+            wp = wp.ewm(span=int(args.smooth_bars), adjust=False).mean()
+        cp = md.close_panel.reindex(wp.index).ffill().dropna()
+        wp = wp.reindex(cp.index).fillna(0.0)
+        if len(cp) < 5:
+            return float("nan"), pd.Series(dtype=float), cp, float("nan"), float("nan")
+        res = run_vector_backtest(cp, wp, config=cfg, strategy_name="holdout")
+        r = res["returns"]; sh = r.mean() / r.std() * np.sqrt(BARS_PER_YEAR_4H) if r.std() > 0 else float("nan")
+        return (sh, r, cp, float(res["turnover"].mean() * BARS_PER_YEAR_4H),
+                float(res["cost"].mean() * BARS_PER_YEAR_4H))
+
+    raw = (np.abs(alpha) >= args.deadband).astype(float) * np.sign(alpha) * fcfg.risk.max_pos_per_symbol
+    sharpe, ret, cp, ann_turn, ann_cost = _port(raw)
+    dsr = deflated_sharpe_ratio(sharpe / np.sqrt(BARS_PER_YEAR_4H) if np.isfinite(sharpe) else float("nan"),
+                                n_obs=len(ret), n_trials=1)
+    fwd = hold["raw_exit_return_long"].to_numpy(float); mk = np.isfinite(alpha) & np.isfinite(fwd)
+    ic = information_coefficient(alpha[mk], fwd[mk])
+
+    # TSMOM baseline on the SAME holdout window
+    tw = vol_parity_tsmom_weights(cp, lookback_mom=90, vol_window=30, cov_window=30, bars_per_year=BARS_PER_YEAR_4H)
+    tret = run_vector_backtest(cp, tw, config=cfg, strategy_name="tsmom")["returns"]
+    tsh = tret.mean() / tret.std() * np.sqrt(BARS_PER_YEAR_4H) if tret.std() > 0 else float("nan")
+
+    dirser = pd.Series(np.where(alpha > fcfg.theta_long, "long",
+                                np.where(alpha < -fcfg.theta_short, "short", "flat")))
+    dirdist = dirser.value_counts(normalize=True).round(4).to_dict()
+
+    print("\n" + "!" * 74)
+    print(" HOLDOUT-A FINAL TEST (consumes the holdout; run ONCE)")
+    print("!" * 74)
+    print(f"    holdout window : {hold['decision_time'].min()} -> {hold['decision_time'].max()}  (rows={len(hold)})")
+    print(f"    config_hash    : {fcfg.config_hash()}   (must equal the value you froze earlier)")
+    print(f"    model IC       : {_fmt(ic)}")
+    print(f"    model Sharpe   : {_fmt(sharpe)}   DSR={_fmt(dsr,'{:.3f}')}")
+    print(f"    model turnover : {_fmt(ann_turn,'{:.0f}')}/yr   cost drag={_fmt(ann_cost*100,'{:.1f}')}%/yr")
+    print(f"    TSMOM Sharpe   : {_fmt(tsh)}   (baseline on same window)")
+    print(f"    direction dist : {dirdist}")
+    verdict = ("MODEL BEATS TSMOM on holdout" if np.isfinite(sharpe) and np.isfinite(tsh) and sharpe > tsh
+               else "model does NOT beat TSMOM on holdout")
+    print(f"    VERDICT        : {verdict}")
+
+    # live §1.4 signal for the latest bar (train on dev, predict latest)
+    sigdf = hold[["symbol", "decision_time"]].copy()
+    sigdf["combined_alpha"] = alpha
+    sigdf["primary_direction"] = dirser.values
+    sigdf["meta_trade_prob_calibrated"] = np.nan
+    latest = _latest_signals(hold, sigdf, fcfg, code_hash="holdout_final")
+    (outdir / "signals_latest.json").write_text(json.dumps(latest, indent=2, ensure_ascii=False))
+
+    rep = [f"# HOLDOUT-A FINAL TEST — {datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}\n",
+           "> Consumes Holdout-A. Per v6 §6.4 this is the once-only confirmatory grade.\n",
+           f"- holdout window: {hold['decision_time'].min()} -> {hold['decision_time'].max()} (rows={len(hold)})",
+           f"- config_hash: `{fcfg.config_hash()}`",
+           f"- model: IC={_fmt(ic)}, Sharpe={_fmt(sharpe)}, DSR={_fmt(dsr,'{:.3f}')}",
+           f"- TSMOM baseline Sharpe: {_fmt(tsh)}",
+           f"- direction distribution: {dirdist}",
+           f"- **VERDICT: {verdict}**"]
+    (outdir / "HOLDOUT_report.md").write_text("\n".join(rep), encoding="utf-8")
+    print(f"\n    HOLDOUT_report.md + signals_latest.json -> {outdir}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", nargs="+",
@@ -219,9 +318,22 @@ def main():
     ap.add_argument("--outdir", default=None, help="output dir (default: data_storage/experiments/<ts>)")
     ap.add_argument("--holdout_frac", type=float, default=0.2, help="final holdout fraction (frozen)")
     ap.add_argument("--patchtst_emb_dim", type=int, default=8)
+    ap.add_argument("--smooth_bars", type=int, default=6,
+                    help="EMA span for position smoothing (low turnover). ~1 day at 4h.")
+    ap.add_argument("--deadband", type=float, default=0.05,
+                    help="ignore |alpha| below this (no trade on weak signal)")
+    ap.add_argument("--tp_mult", type=float, default=None,
+                    help="override take-profit barrier (ATR mult). Symmetric labels: --tp_mult 1.5 --sl_mult 1.5")
+    ap.add_argument("--sl_mult", type=float, default=None, help="override stop-loss barrier (ATR mult)")
+    ap.add_argument("--run_holdout", action="store_true",
+                    help="FINAL TEST: train on dev, evaluate the frozen holdout ONCE (consumes Holdout-A)")
     args = ap.parse_args()
 
     fcfg = FrozenConfig()
+    if args.tp_mult is not None or args.sl_mult is not None:   # research knob -> new config_hash (logged)
+        fcfg = replace(fcfg, label=replace(fcfg.label,
+                                           tp_mult=args.tp_mult if args.tp_mult is not None else fcfg.label.tp_mult,
+                                           sl_mult=args.sl_mult if args.sl_mult is not None else fcfg.label.sl_mult))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     outdir = Path(args.outdir) if args.outdir else Path(config.PathConfig.EXPERIMENTS) / stamp
     outdir.mkdir(parents=True, exist_ok=True)
@@ -229,11 +341,16 @@ def main():
     print("=" * 74)
     print(f" v6 MARKET EXPERIMENT  (LightGBM + PatchTST)   {stamp}")
     print(f" config_hash={fcfg.config_hash()}   env={environment_hash()}")
-    print(f" mode={'SYNTHETIC (wiring check)' if args.synthetic else 'REAL parquet'}")
+    print(f" deployment: smooth_bars={args.smooth_bars} deadband={args.deadband} "
+          f"max_pos={fcfg.risk.max_pos_per_symbol} (low-turnover)")
+    print(f" label barriers: tp={fcfg.label.tp_mult} sl={fcfg.label.sl_mult}"
+          f"{'  [SYMMETRIC]' if fcfg.label.tp_mult == fcfg.label.sl_mult else ''}")
+    print(f" mode={'SYNTHETIC (wiring check)' if args.synthetic else 'REAL parquet'}"
+          f"{'  + HOLDOUT FINAL TEST' if args.run_holdout else ''}")
     print(f" outputs -> {outdir}")
     print("=" * 74)
 
-    # ---- 1. dataset ----
+    # ---- 1. dataset (full) ----
     provider = None
     if args.synthetic:
         seeds = {s: i + 1 for i, s in enumerate(args.symbols)}
@@ -254,53 +371,65 @@ def main():
     print(f"    future_function_checks_passed = {md.audit['future_function_checks_passed']}  "
           f"(violations={md.audit['availability_lag_violations']}, rows={md.audit['n_rows']})")
 
-    # ---- 2. incremental ladder ----
-    print("\n[3] INCREMENTAL PROOF LADDER (Step0 -> Step6)")
-    ladder = run_incremental_study(md.dataset, md.close_panel, md.modality_cols, fcfg,
-                                   bars_per_year=BARS_PER_YEAR_4H)
+    # ---- dev / holdout split (holdout is NEVER used during development) ----
+    cut = _split_cut(md.dataset, args.holdout_frac)
+
+    if args.run_holdout:
+        _run_holdout(md, cut, fcfg, outdir, args)
+        print(f"\nDONE (holdout). Report in: {outdir}")
+        return
+
+    dev = md.dataset[md.dataset["decision_time"] < cut].reset_index(drop=True)
+    dev_close = md.close_panel.loc[md.close_panel.index < cut]
+    n_hold = int((md.dataset["decision_time"] >= cut).sum())
+    print(f"\n[*] DEV/HOLDOUT SPLIT: experiment uses DEV only "
+          f"(dev rows={len(dev)}, holdout rows={n_hold} from {pd.Timestamp(cut)} are untouched)")
+
+    # ---- 2. incremental ladder (DEV ONLY) ----
+    print("\n[3] INCREMENTAL PROOF LADDER (Step0 -> Step6)  [dev only]")
+    ladder = run_incremental_study(dev, dev_close, md.modality_cols, fcfg, bars_per_year=BARS_PER_YEAR_4H,
+                                   smooth_bars=args.smooth_bars, deadband=args.deadband)
     pd.set_option("display.width", 180, "display.max_columns", 20)
     print(ladder.round(4).to_string())
     ladder.to_csv(outdir / "incremental_ladder.csv")
 
-    # ---- 3. A/B/C/D ablation ----
-    print("\n[4] PATCHTST A/B/C/D ABLATION")
+    # ---- 3. A/B/C/D ablation (DEV ONLY) ----
+    print("\n[4] PATCHTST A/B/C/D ABLATION  [dev only]")
     horizon_bars = max(2, int(fcfg.label.vertical_days * 6))
-    ablation = run_ablation(md.dataset, md.tabular_cols, fcfg,
+    ablation = run_ablation(dev, md.tabular_cols, fcfg,
                             bars_per_year=BARS_PER_YEAR_4H, max_label_horizon_bars=horizon_bars)
     print(ablation.round(4).to_string())
     ablation.to_csv(outdir / "patchtst_ablation.csv")
 
-    # ---- 4. PBO ----
+    # ---- 4. PBO (DEV ONLY) ----
     print("\n[5] PBO (CSCV over A/B/C/D, development period)")
-    pbo = _pbo_over_abcd(md.dataset, md.tabular_cols, fcfg)
+    pbo = _pbo_over_abcd(dev, md.tabular_cols, fcfg)
     print(f"    PBO = {_fmt(pbo['pbo'], '{:.3f}')}  over {pbo['n_combinations']} combinations "
           f"(lower is better; <0.5 = IS-best tends to stay good OOS)")
 
-    # ---- 5. phase-1b signals + ECE ----
-    print("\n[6] PHASE-1B SIGNALS (two-stage meta-labelling + calibration)")
-    signals, diag = run_phase1b(md.dataset, md.feature_cols, fcfg)
+    # ---- 5. phase-1b signals + ECE (DEV ONLY) ----
+    print("\n[6] PHASE-1B SIGNALS (two-stage meta-labelling + calibration)  [dev only]")
+    signals, diag = run_phase1b(dev, md.feature_cols, fcfg)
     for k, v in diag.items():
         print(f"    {k}: {v}")
     signals.to_csv(outdir / "signals_oof.csv", index=False)
 
-    # ---- 6. §1.4 latest structured signals ----
-    latest = _latest_signals(md.dataset, signals, fcfg)
+    # ---- 6. §1.4 latest structured signals (end of dev) ----
+    latest = _latest_signals(dev, signals, fcfg)
     (outdir / "signals_latest.json").write_text(json.dumps(latest, indent=2, ensure_ascii=False))
     print(f"    latest structured signals -> signals_latest.json ({len(latest)} symbols)")
 
     # ---- 7. governance: freeze + pre-register (do NOT run holdout) ----
     print("\n[7] GOVERNANCE (freeze + pre-register; Holdout-A NOT run here)")
-    dt_series = md.dataset["decision_time"].sort_values().reset_index(drop=True)
-    cut = dt_series.iloc[int(len(dt_series) * (1 - args.holdout_frac))]
-    dev_idx, hold_idx = dev_holdout_split(md.dataset["decision_time"], cut)
     fp = outdir / "frozen_config.json"
     h = freeze_config(fcfg, fp)
     load_frozen(fp)
     reg = outdir / "registry.json"
     pre_register(fcfg.to_dict(), reg, label="market_experiment_confirmatory")
     assert_preregistered(fcfg.to_dict(), reg)
-    print(f"    dev rows={len(dev_idx)}  holdout rows={len(hold_idx)} (holdout_start={pd.Timestamp(cut)})")
+    print(f"    dev rows={len(dev)}  holdout rows={n_hold} (holdout_start={pd.Timestamp(cut)})")
     print(f"    frozen config_hash={h}  pre-registration OK")
+    print("    -> to grade on the holdout LATER (once): rerun the SAME command with --run_holdout")
 
     # ---- 8. acceptance checklist + report ----
     print("\n[8] ACCEPTANCE CHECKLIST (v6 gates)")

@@ -72,32 +72,51 @@ def _oof_alpha(df: pd.DataFrame, cols: List[str], fcfg, splits) -> np.ndarray:
     return alpha
 
 
+def _cost_rates(fcfg):
+    """Per-leg fee + slippage as fractions, read from CostConfig (was hardcoded)."""
+    if fcfg is not None:
+        return fcfg.cost.fee_bps / 1e4, (fcfg.cost.base_slippage_bps + fcfg.cost.spread_proxy_bps) / 1e4
+    return 0.0004, 0.0004
+
+
 def _alpha_to_returns(df, alpha, close_panel, bars_per_year, max_pos,
-                      meta_prob=None, p_threshold=0.55, vol_target=False, fcfg=None):
-    """Turn an OOF alpha (+ optional meta gate) into per-period portfolio returns
-    via the EXISTING backtest engine (so all steps are comparable)."""
-    pos = np.sign(np.nan_to_num(alpha)) * max_pos
+                      meta_prob=None, p_threshold=0.55, fcfg=None,
+                      smooth_bars=1, deadband=0.0):
+    """Deploy an OOF alpha as a LOW-TURNOVER target-weight panel, then run it through
+    the existing backtest engine. Turnover control (so a multi-day signal is not
+    re-flipped every 4h bar):
+      * deadband  -> ignore |alpha| < deadband (no trade on weak signal)
+      * meta gate -> flat when meta_prob <= p_threshold
+      * smoothing -> EMA the target weight over `smooth_bars` (position persistence)
+    Returns (returns, ann_turnover, ann_cost_fraction)."""
+    a = np.nan_to_num(alpha)
+    raw = (np.abs(a) >= deadband).astype(float) * np.sign(a) * max_pos
     if meta_prob is not None:
-        pos = pos * (np.nan_to_num(meta_prob) > p_threshold).astype(float)
+        raw = raw * (np.nan_to_num(meta_prob) > p_threshold).astype(float)
     tmp = df[["symbol", "decision_time"]].copy()
-    tmp["w"] = pos
+    tmp["w"] = raw
     w = tmp.pivot_table(index="decision_time", columns="symbol", values="w", aggfunc="last").fillna(0)
+    if smooth_bars and smooth_bars > 1:
+        w = w.ewm(span=int(smooth_bars), adjust=False).mean()       # position smoothing
     cp = close_panel.reindex(w.index).ffill().dropna()
     w = w.reindex(cp.index).fillna(0.0)
     if len(cp) < 5:
-        return pd.Series(dtype=float)
-    cfg = BacktestConfig(fee_rate=0.0004, slippage_rate=0.0003, execution_lag=1,
-                         annual_days=bars_per_year)
+        return pd.Series(dtype=float), float("nan"), float("nan")
+    fee, slip = _cost_rates(fcfg)
+    cfg = BacktestConfig(fee_rate=fee, slippage_rate=slip, execution_lag=1, annual_days=bars_per_year)
     res = run_vector_backtest(cp, w, config=cfg, strategy_name="step")
-    return res["returns"]
+    return (res["returns"], float(res["turnover"].mean() * bars_per_year),
+            float(res["cost"].mean() * bars_per_year))
 
 
-def _tsmom_returns(close_panel, bars_per_year):
+def _tsmom_returns(close_panel, bars_per_year, fcfg=None):
     w = vol_parity_tsmom_weights(close_panel, lookback_mom=90, vol_window=30,
                                  cov_window=30, bars_per_year=bars_per_year)
-    cfg = BacktestConfig(fee_rate=0.0004, slippage_rate=0.0003, execution_lag=1,
-                         annual_days=bars_per_year)
-    return run_vector_backtest(close_panel, w, config=cfg, strategy_name="tsmom")["returns"]
+    fee, slip = _cost_rates(fcfg)
+    cfg = BacktestConfig(fee_rate=fee, slippage_rate=slip, execution_lag=1, annual_days=bars_per_year)
+    res = run_vector_backtest(close_panel, w, config=cfg, strategy_name="tsmom")
+    return (res["returns"], float(res["turnover"].mean() * bars_per_year),
+            float(res["cost"].mean() * bars_per_year))
 
 
 def _fusion_alpha(df, modality_cols, fcfg, splits):
@@ -150,7 +169,9 @@ def run_incremental_study(
     fwd_col: str = "raw_exit_return_long",
     bars_per_year: int = 2190,
     t_threshold: float = 2.0,
-    max_pos: float = 0.2,
+    max_pos: float = None,
+    smooth_bars: int = 6,
+    deadband: float = 0.05,
     kind: str = "exploratory",
 ) -> pd.DataFrame:
     """
@@ -171,43 +192,50 @@ def run_incremental_study(
     nv = modality_cols.get("narrative", [])
     pt = modality_cols.get("patchtst", [])
 
-    # build each step's (alpha, returns)
-    steps = []  # (name, alpha_or_None, returns_series)
+    if max_pos is None:
+        max_pos = fcfg.risk.max_pos_per_symbol
 
-    # Step0 baseline TSMOM
-    steps.append(("Step0_baseline_tsmom", None, _tsmom_returns(close_panel, bars_per_year)))
+    def deploy(a, meta=None):
+        return _alpha_to_returns(df, a, close_panel, bars_per_year, max_pos,
+                                 meta_prob=meta, p_threshold=fcfg.risk.p_threshold, fcfg=fcfg,
+                                 smooth_bars=smooth_bars, deadband=deadband)
+
+    steps = []  # (name, alpha_or_None, returns, ann_turnover, ann_cost)
+    r0, t0, c0 = _tsmom_returns(close_panel, bars_per_year, fcfg)
+    steps.append(("Step0_baseline_tsmom", None, r0, t0, c0))
 
     cumulative = []
     for name, group in [("Step1_market", mk), ("Step2_+onchain", oc),
                         ("Step3_+narrative", nv), ("Step4_+patchtst", pt)]:
         new_cols = [c for c in group if c in df.columns]
         if not new_cols:                      # modality has no data -> carry previous
-            steps.append((name, None, None))
+            steps.append((name, None, None, np.nan, np.nan))
             continue
         cumulative = cumulative + new_cols
         a = _oof_alpha(df, cumulative, fcfg, splits)
-        r = _alpha_to_returns(df, a, close_panel, bars_per_year, max_pos)
-        steps.append((name, a, r))
+        r, tn, cs = deploy(a)
+        steps.append((name, a, r, tn, cs))
 
     # Step5 fusion (mean of per-modality OOF alphas)
     fused, base_oof = _fusion_alpha(df, {"market": mk, "onchain": oc,
                                          "narrative": nv, "patchtst": pt}, fcfg, splits)
-    steps.append(("Step5_fusion", fused, _alpha_to_returns(df, fused, close_panel, bars_per_year, max_pos)))
+    r5, t5, c5 = deploy(fused)
+    steps.append(("Step5_fusion", fused, r5, t5, c5))
 
-    # Step6 meta gate
+    # Step6 meta gate (adds the meta-probability gate on top of fusion)
     direction, meta_prob = _meta_gate(df, fused, base_oof, fcfg, splits)
-    steps.append(("Step6_meta_gate", fused,
-                  _alpha_to_returns(df, fused, close_panel, bars_per_year, max_pos,
-                                    meta_prob=meta_prob, p_threshold=fcfg.risk.p_threshold)))
+    r6, t6, c6 = deploy(fused, meta=meta_prob)
+    steps.append(("Step6_meta_gate", fused, r6, t6, c6))
 
     # assemble metrics + incremental significance vs previous *non-skipped* step
-    n_steps = sum(1 for _, _, r in steps if r is not None)
+    n_steps = sum(1 for _, _, r, _, _ in steps if r is not None)
     rows, prev_ret = [], None
-    for name, alpha, ret in steps:
+    for name, alpha, ret, tn, cs in steps:
         if ret is None or len(ret) < 5:
             rows.append({"step": name, "research_question": RESEARCH_QUESTION.get(name, ""),
                          "status": "skipped (no features)", "IC": np.nan, "sharpe_ann": np.nan,
-                         "deflated_sharpe": np.nan, "incr_NW_t": np.nan, "included": False})
+                         "deflated_sharpe": np.nan, "incr_NW_t": np.nan,
+                         "ann_turnover": np.nan, "ann_cost_pct": np.nan, "included": False})
             continue
         sd = ret.std()
         sharpe = ret.mean() / sd * np.sqrt(bars_per_year) if sd > 0 else np.nan
@@ -215,8 +243,8 @@ def run_incremental_study(
                                     n_obs=len(ret), n_trials=max(n_steps, 1))
         ic = np.nan
         if alpha is not None:
-            m = np.isfinite(alpha) & np.isfinite(fwd)
-            ic = information_coefficient(alpha[m], fwd[m])
+            mm = np.isfinite(alpha) & np.isfinite(fwd)
+            ic = information_coefficient(alpha[mm], fwd[mm])
         incr_t, included = np.nan, None
         if prev_ret is not None:
             common = ret.index.intersection(prev_ret.index)
@@ -228,7 +256,9 @@ def run_incremental_study(
             included = True  # baseline always "in"
         rows.append({"step": name, "research_question": RESEARCH_QUESTION.get(name, ""),
                      "status": kind, "IC": ic, "sharpe_ann": sharpe,
-                     "deflated_sharpe": dsr, "incr_NW_t": incr_t, "included": included})
+                     "deflated_sharpe": dsr, "incr_NW_t": incr_t,
+                     "ann_turnover": tn, "ann_cost_pct": (cs * 100 if np.isfinite(cs) else np.nan),
+                     "included": included})
         prev_ret = ret
 
     return pd.DataFrame(rows).set_index("step")

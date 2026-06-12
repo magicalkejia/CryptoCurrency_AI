@@ -26,8 +26,12 @@ from typing import Literal
 @dataclass(frozen=True)
 class LabelConfig:
     entry_rule: Literal["next_1h_open", "next_1m_open"] = "next_1h_open"
-    tp_mult: float = 2.0
-    sl_mult: float = 1.0
+    # Symmetric barriers by default: tb_label is the PRIMARY DIRECTIONAL target, so
+    # asymmetric (2:1) barriers mechanically bias labels toward the near side (down),
+    # teaching the model to always short. Symmetric keeps up/down classes balanced.
+    # (Override per-experiment, e.g. --tp_mult/--sl_mult, for risk-reward studies.)
+    tp_mult: float = 1.5
+    sl_mult: float = 1.5
     vertical_days: int = 5
     atr_window: int = 20                 # ATR(20) on 1h bars
     neutral_threshold_frac: float = 0.5  # neutral_threshold = frac * barrier_width_pct
