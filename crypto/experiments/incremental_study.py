@@ -52,6 +52,7 @@ RESEARCH_QUESTION = {
     "Step4_+patchtst": "PatchTST 时序表征是否有增量?",
     "Step5_fusion": "多模态融合是否优于单模型?",
     "Step6_meta_gate": "元标签/概率门控是否提升风险收益比?",
+    "Step7_tsmom_fusion": "ML信号与TSMOM融合(而非替代)能否跑赢单独TSMOM?",
 }
 
 
@@ -79,25 +80,30 @@ def _cost_rates(fcfg):
     return 0.0004, 0.0004
 
 
-def _alpha_to_returns(df, alpha, close_panel, bars_per_year, max_pos,
-                      meta_prob=None, p_threshold=0.55, fcfg=None,
-                      smooth_bars=1, deadband=0.0):
-    """Deploy an OOF alpha as a LOW-TURNOVER target-weight panel, then run it through
-    the existing backtest engine. Turnover control (so a multi-day signal is not
-    re-flipped every 4h bar):
-      * deadband  -> ignore |alpha| < deadband (no trade on weak signal)
-      * meta gate -> flat when meta_prob <= p_threshold
-      * smoothing -> EMA the target weight over `smooth_bars` (position persistence)
-    Returns (returns, ann_turnover, ann_cost_fraction)."""
+def _alpha_to_weight_panel(df, alpha, close_panel, max_pos, fcfg,
+                           smooth_bars=1, deadband=0.0, meta_prob=None, p_threshold=0.55):
+    """Build a LOW-TURNOVER, CONVICTION-SIZED target-weight panel from an OOF alpha.
+      * conviction -> position size scales with |alpha| (capped at max_pos when
+        |alpha| >= edge_cap), so weak signals get small positions, strong ones full.
+      * deadband   -> ignore |alpha| < deadband (no trade on weak signal)
+      * meta gate  -> flat when meta_prob <= p_threshold
+      * smoothing  -> EMA the target weight over `smooth_bars` (hold ~horizon)."""
+    scale = fcfg.risk.edge_cap if fcfg is not None else 0.2
     a = np.nan_to_num(alpha)
-    raw = (np.abs(a) >= deadband).astype(float) * np.sign(a) * max_pos
+    conviction = np.clip(np.abs(a) / max(scale, 1e-9), 0.0, 1.0)        # in [0,1]
+    raw = (np.abs(a) >= deadband).astype(float) * np.sign(a) * conviction * max_pos
     if meta_prob is not None:
         raw = raw * (np.nan_to_num(meta_prob) > p_threshold).astype(float)
     tmp = df[["symbol", "decision_time"]].copy()
     tmp["w"] = raw
     w = tmp.pivot_table(index="decision_time", columns="symbol", values="w", aggfunc="last").fillna(0)
     if smooth_bars and smooth_bars > 1:
-        w = w.ewm(span=int(smooth_bars), adjust=False).mean()       # position smoothing
+        w = w.ewm(span=int(smooth_bars), adjust=False).mean()           # position persistence
+    return w
+
+
+def _panel_to_returns(close_panel, w, bars_per_year, fcfg):
+    """Run a target-weight panel through the existing backtest engine."""
     cp = close_panel.reindex(w.index).ffill().dropna()
     w = w.reindex(cp.index).fillna(0.0)
     if len(cp) < 5:
@@ -109,14 +115,25 @@ def _alpha_to_returns(df, alpha, close_panel, bars_per_year, max_pos,
             float(res["cost"].mean() * bars_per_year))
 
 
+def _alpha_to_returns(df, alpha, close_panel, bars_per_year, max_pos,
+                      meta_prob=None, p_threshold=0.55, fcfg=None,
+                      smooth_bars=1, deadband=0.0):
+    """Conviction-sized, low-turnover deployment of an OOF alpha.
+    Returns (returns, ann_turnover, ann_cost_fraction)."""
+    w = _alpha_to_weight_panel(df, alpha, close_panel, max_pos, fcfg,
+                               smooth_bars=smooth_bars, deadband=deadband,
+                               meta_prob=meta_prob, p_threshold=p_threshold)
+    return _panel_to_returns(close_panel, w, bars_per_year, fcfg)
+
+
+def _tsmom_weight_panel(close_panel, bars_per_year):
+    return vol_parity_tsmom_weights(close_panel, lookback_mom=90, vol_window=30,
+                                    cov_window=30, bars_per_year=bars_per_year)
+
+
 def _tsmom_returns(close_panel, bars_per_year, fcfg=None):
-    w = vol_parity_tsmom_weights(close_panel, lookback_mom=90, vol_window=30,
-                                 cov_window=30, bars_per_year=bars_per_year)
-    fee, slip = _cost_rates(fcfg)
-    cfg = BacktestConfig(fee_rate=fee, slippage_rate=slip, execution_lag=1, annual_days=bars_per_year)
-    res = run_vector_backtest(close_panel, w, config=cfg, strategy_name="tsmom")
-    return (res["returns"], float(res["turnover"].mean() * bars_per_year),
-            float(res["cost"].mean() * bars_per_year))
+    w = _tsmom_weight_panel(close_panel, bars_per_year)
+    return _panel_to_returns(close_panel, w, bars_per_year, fcfg)
 
 
 def _fusion_alpha(df, modality_cols, fcfg, splits):
@@ -226,6 +243,21 @@ def run_incremental_study(
     direction, meta_prob = _meta_gate(df, fused, base_oof, fcfg, splits)
     r6, t6, c6 = deploy(fused, meta=meta_prob)
     steps.append(("Step6_meta_gate", fused, r6, t6, c6))
+
+    # Step7 TSMOM fusion: COMBINE (not replace) the strong momentum baseline with
+    # the meta-gated ML signal via a fixed 50/50 convex blend of their weight panels.
+    # beta=0.5 is a neutral prior (not tuned to Sharpe).
+    w_ml = _alpha_to_weight_panel(df, fused, close_panel, max_pos, fcfg,
+                                  smooth_bars=smooth_bars, deadband=deadband,
+                                  meta_prob=meta_prob, p_threshold=fcfg.risk.p_threshold)
+    w_ts = _tsmom_weight_panel(close_panel, bars_per_year)
+    idx = w_ts.index.union(w_ml.index)
+    cols = w_ts.columns.union(w_ml.columns)
+    beta = 0.5
+    w_blend = (beta * w_ts.reindex(index=idx, columns=cols).fillna(0.0)
+               + (1 - beta) * w_ml.reindex(index=idx, columns=cols).fillna(0.0))
+    r7, t7, c7 = _panel_to_returns(close_panel, w_blend, bars_per_year, fcfg)
+    steps.append(("Step7_tsmom_fusion", fused, r7, t7, c7))
 
     # assemble metrics + incremental significance vs previous *non-skipped* step
     n_steps = sum(1 for _, _, r, _, _ in steps if r is not None)

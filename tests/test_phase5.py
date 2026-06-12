@@ -175,7 +175,7 @@ def test_incremental_study_runs_all_steps():
     table = run_incremental_study(df, close_panel, modality, fcfg, bars_per_year=2190, max_pos=0.2)
     assert list(table.index) == ["Step0_baseline_tsmom", "Step1_market", "Step2_+onchain",
                                  "Step3_+narrative", "Step4_+patchtst", "Step5_fusion",
-                                 "Step6_meta_gate"]
+                                 "Step6_meta_gate", "Step7_tsmom_fusion"]
     assert "incr_NW_t" in table.columns and "research_question" in table.columns
     # every non-baseline step has a research question mapped
     assert table.loc["Step1_market", "research_question"] != ""

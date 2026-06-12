@@ -386,7 +386,7 @@ def main():
           f"(dev rows={len(dev)}, holdout rows={n_hold} from {pd.Timestamp(cut)} are untouched)")
 
     # ---- 2. incremental ladder (DEV ONLY) ----
-    print("\n[3] INCREMENTAL PROOF LADDER (Step0 -> Step6)  [dev only]")
+    print("\n[3] INCREMENTAL PROOF LADDER (Step0 -> Step7)  [dev only]")
     ladder = run_incremental_study(dev, dev_close, md.modality_cols, fcfg, bars_per_year=BARS_PER_YEAR_4H,
                                    smooth_bars=args.smooth_bars, deadband=args.deadband)
     pd.set_option("display.width", 180, "display.max_columns", 20)
