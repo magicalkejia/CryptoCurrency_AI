@@ -117,7 +117,7 @@ def fetch_dune_onchain(query_id: int, api_key: str, name: str,
     out = Path(raw_dir) / f"onchain_{name}.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
     df.reset_index().to_parquet(out, engine="pyarrow", compression="zstd", index=False)
-    print(f"💾 Dune on-chain '{name}' saved {len(df)} rows -> {out}")
+    print(f"saved Dune on-chain '{name}' {len(df)} rows -> {out}")
     return df
 
 

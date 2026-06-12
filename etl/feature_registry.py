@@ -6,7 +6,112 @@
 # It lets model/Agent developers inspect what every feature means without
 # reading each builder function. The values are descriptive metadata only;
 # actual calculations are implemented in the builder functions below.
+from __future__ import annotations
+
+from fnmatch import fnmatch
+from typing import Sequence
+
 import pandas as pd
+
+
+MARKET_CORE_FEATURES: list[str] = [
+    # 4h decision-grid market state.
+    "ret_4h",
+    "ret_24h",
+    "ret_96h",
+    "vol_96h",
+    "range_4h",
+    "close_position_in_4h_range",
+    "volume_z_96h",
+    "net_taker_vol_z_96h",
+    # 1h short-term summary merged into the 4h decision grid.
+    "ret_1h",
+    "ret_3h",
+    "ret_6h",
+    "ret_12h",
+    "ret_24h_from_1h",
+    "vol_24h_from_1h",
+    "volume_z_24h_from_1h",
+    "range_6h_from_1h",
+    "net_taker_vol_6h",
+    "net_taker_vol_z_24h_from_1h",
+    # 1d regime context.
+    "ret_7d",
+    "ret_30d",
+    "vol_30d",
+    "daily_ma_gap_7_30",
+    "daily_trend_up",
+    "drawdown_from_30d_high",
+]
+
+
+FUNDING_EXTENSION_FEATURES: list[str] = [
+    "funding_rate_8h_equiv",
+    "funding_rate_chg",
+    "funding_rate_z_30_events",
+]
+
+
+ONCHAIN_EXTENSION_FEATURES: list[str] = [
+    "onchain_defillama_selected_chains_tvl_usd_chg_7d",
+    "onchain_defillama_selected_chains_tvl_usd_z_30d",
+    "onchain_defillama_stablecoin_mcap_usd_chg_7d",
+    "onchain_defillama_stablecoin_mcap_usd_z_30d",
+    "onchain_defillama_dex_volume_usd_chg_7d",
+    "onchain_defillama_fees_usd_z_30d",
+]
+
+
+MODEL_FEATURE_SETS: dict[str, list[str]] = {
+    # Default compact set for about 10k 4h samples. Avoids raw price levels,
+    # raw volume levels and experimental optional-source columns.
+    "market_core_v1": MARKET_CORE_FEATURES,
+    "market_plus_funding_v1": MARKET_CORE_FEATURES + FUNDING_EXTENSION_FEATURES,
+    "market_plus_onchain_v1": MARKET_CORE_FEATURES + ONCHAIN_EXTENSION_FEATURES,
+    "market_plus_funding_onchain_v1": (
+        MARKET_CORE_FEATURES
+        + FUNDING_EXTENSION_FEATURES
+        + ONCHAIN_EXTENSION_FEATURES
+    ),
+}
+
+DEFAULT_MODEL_FEATURE_SET = "market_core_v1"
+
+
+def get_model_feature_columns(feature_set: str = DEFAULT_MODEL_FEATURE_SET) -> list[str]:
+    """Return explicitly approved model feature columns for a named feature set."""
+    if feature_set not in MODEL_FEATURE_SETS:
+        available = ", ".join(sorted(MODEL_FEATURE_SETS))
+        raise KeyError(f"Unknown feature set {feature_set!r}. Available feature sets: {available}")
+    return list(MODEL_FEATURE_SETS[feature_set])
+
+
+def get_model_feature_sets() -> pd.DataFrame:
+    """Return a compact table of named model feature sets and their columns."""
+    rows = []
+    for name, columns in MODEL_FEATURE_SETS.items():
+        rows.append({
+            "feature_set": name,
+            "n_features": len(columns),
+            "features": columns,
+        })
+    return pd.DataFrame(rows)
+
+
+def validate_model_feature_sets(feature_definitions: Sequence[str] | None = None) -> None:
+    """Validate that explicit model feature sets reference documented features."""
+    known = set(feature_definitions or FEATURE_DEFINITIONS)
+    patterns = [name for name in known if "*" in name]
+    missing = {
+        feature
+        for columns in MODEL_FEATURE_SETS.values()
+        for feature in columns
+        if feature not in known and not any(fnmatch(feature, pattern) for pattern in patterns)
+    }
+    if missing:
+        raise ValueError(f"Model feature sets reference undocumented features: {sorted(missing)}")
+
+
 FEATURE_DEFINITIONS: dict[str, dict[str, str]] = {
     # ------------------------------------------------------------------
     # Identity / time grid
@@ -184,7 +289,18 @@ FEATURE_DEFINITIONS: dict[str, dict[str, str]] = {
     "spot_cvd_proxy_4h": {"group": "flow", "definition": "Cumulative proxy CVD from 4h net taker volume.", "calculation": "cumsum(net_taker_vol_4h.fillna(0)) when include_cvd_proxy=True.", "source": "derived from market net_taker_vol_4h", "usage": "Proxy for cumulative aggressive buy/sell pressure; not true tick-level CVD."},
     "spot_cvd_proxy_chg_4h": {"group": "flow", "definition": "Change in proxy CVD from previous 4h decision bar.", "calculation": "spot_cvd_proxy_4h.diff().", "source": "derived from spot_cvd_proxy_4h", "usage": "Incremental flow pressure."},
     "sentiment_xxx": {"group": "sentiment", "definition": "Any numeric sentiment feature loaded from processed/sentiment/x_sentiment_4h.parquet.", "calculation": "Existing numeric columns are carried through, prefixed if needed, and asof-merged by sentiment_available_time <= decision_time.", "source": "processed sentiment table", "usage": "Narrative / attention / event-risk feature."},
-    "onchain_xxx": {"group": "onchain", "definition": "Any numeric on-chain feature loaded from processed/onchain/onchain_daily.parquet.", "calculation": "Existing numeric columns are prefixed with onchain_ if needed and asof-merged with cfg.onchain_availability_lag, default 1d.", "source": "processed on-chain daily table", "usage": "Slow-moving chain activity / flow regime."},
+    "onchain_defillama_tvl_bitcoin_usd": {"group": "onchain_base", "definition": "DefiLlama historical TVL for the Bitcoin DeFi ecosystem.", "calculation": "Daily last value from raw/onchain/defillama/chain_tvl_bitcoin.parquet.", "source": "DefiLlama /v2/historicalChainTvl/Bitcoin", "usage": "BTC ecosystem DeFi activity proxy. This is not native BTC address or transfer activity."},
+    "onchain_defillama_tvl_ethereum_usd": {"group": "onchain_base", "definition": "DefiLlama historical TVL for the Ethereum DeFi ecosystem.", "calculation": "Daily last value from raw/onchain/defillama/chain_tvl_ethereum.parquet.", "source": "DefiLlama /v2/historicalChainTvl/Ethereum", "usage": "ETH ecosystem DeFi capital/activity state."},
+    "onchain_defillama_tvl_solana_usd": {"group": "onchain_base", "definition": "DefiLlama historical TVL for the Solana DeFi ecosystem.", "calculation": "Daily last value from raw/onchain/defillama/chain_tvl_solana.parquet.", "source": "DefiLlama /v2/historicalChainTvl/Solana", "usage": "SOL ecosystem DeFi capital/activity state."},
+    "onchain_defillama_tvl_bsc_usd": {"group": "onchain_base", "definition": "DefiLlama historical TVL for the BSC DeFi ecosystem.", "calculation": "Daily last value from raw/onchain/defillama/chain_tvl_bsc.parquet.", "source": "DefiLlama /v2/historicalChainTvl/BSC", "usage": "BNB/BSC ecosystem DeFi capital/activity state."},
+    "onchain_defillama_selected_chains_tvl_usd": {"group": "onchain_base", "definition": "Total TVL across selected project chains.", "calculation": "Row-wise sum of available onchain_defillama_tvl_{chain}_usd columns.", "source": "processed/onchain/onchain_daily.parquet", "usage": "Cross-chain DeFi liquidity regime proxy."},
+    "onchain_defillama_stablecoin_mcap_usd": {"group": "onchain_base", "definition": "Aggregate stablecoin circulating market capitalization.", "calculation": "Daily value from raw/onchain/defillama/stablecoins_all.parquet.", "source": "DefiLlama stablecoins.llama.fi/stablecoincharts/all", "usage": "Crypto liquidity / dry-powder proxy."},
+    "onchain_defillama_dex_volume_usd": {"group": "onchain_base", "definition": "Global daily decentralized exchange volume.", "calculation": "Daily value from raw/onchain/defillama/dex_volume_global.parquet.", "source": "DefiLlama /overview/dexs", "usage": "On-chain trading activity proxy."},
+    "onchain_defillama_fees_usd": {"group": "onchain_base", "definition": "Global daily fees paid to crypto protocols tracked by DefiLlama.", "calculation": "Daily value from raw/onchain/defillama/fees_revenue_global.parquet.", "source": "DefiLlama /overview/fees", "usage": "Protocol demand / paid usage proxy."},
+    "onchain_*_chg_1d": {"group": "onchain_derived", "definition": "One-day percentage change for an on-chain base metric.", "calculation": "x_t / x_{t-1} - 1, computed in etl/onchain_feature_builder.py.", "source": "factors/onchain_features.parquet", "usage": "Short-horizon change; helps reduce non-stationary level effects."},
+    "onchain_*_chg_7d": {"group": "onchain_derived", "definition": "Seven-day percentage change for an on-chain base metric.", "calculation": "x_t / x_{t-7} - 1, computed in etl/onchain_feature_builder.py.", "source": "factors/onchain_features.parquet", "usage": "Weekly growth / contraction state."},
+    "onchain_*_z_30d": {"group": "onchain_derived", "definition": "Thirty-day rolling z-score for an on-chain base metric.", "calculation": "(x_t - rolling_mean_30d) / rolling_std_30d, computed with right-aligned rolling windows.", "source": "factors/onchain_features.parquet", "usage": "Recent abnormality relative to the metric's own short history."},
+    "onchain_xxx": {"group": "onchain", "definition": "Any numeric on-chain feature loaded from factors/onchain_features.parquet, with processed/onchain/onchain_daily.parquet as fallback.", "calculation": "Base metrics are cleaned in onchain_processor.py; derived metrics are built in onchain_feature_builder.py; final merge uses cfg.onchain_availability_lag, default 1d.", "source": "factors on-chain table", "usage": "Slow-moving chain activity / DeFi liquidity regime."},
 
     # ------------------------------------------------------------------
     # PIT audit columns

@@ -33,6 +33,13 @@ class DataLoader:
         self.processed_derivatives_dir = Path(
             getattr(config.PathConfig, "PROCESSED_DERIVATIVES", self.processed_dir / "derivatives")
         )
+        self.raw_onchain_dir = Path(
+            getattr(config.PathConfig, "RAW_ONCHAIN", self.raw_dir / "onchain")
+        )
+        self.processed_onchain_dir = Path(
+            getattr(config.PathConfig, "PROCESSED_ONCHAIN", self.processed_dir / "onchain")
+        )
+        self.factors_dir = Path(config.PathConfig.FACTORS)
 
         # 历史股票路径，暂时保留兼容，不参与 crypto 主线。
         self.a_share_meta_dir = Path(config.PathConfig.DATA_ROOT) / "meta"
@@ -382,6 +389,127 @@ class DataLoader:
         idx = df.groupby("symbol")["timestamp"].idxmax()
         latest = df.loc[idx].sort_values("symbol").reset_index(drop=True)
         return latest[["symbol", "timestamp", field]]
+
+    # =====================================================================
+    # On-chain data query interfaces
+    # =====================================================================
+    def list_onchain_tables(self, layer: str = "processed", source: str | None = None):
+        """
+        List available on-chain parquet tables.
+
+        layer="processed":
+            data_storage/processed/onchain/*.parquet
+
+        layer="raw":
+            data_storage/raw/onchain/{source or *}/*.parquet
+
+        layer="factors":
+            data_storage/factors/onchain*.parquet
+        """
+        root = self._onchain_root(layer=layer, source=source)
+        rows = []
+        pattern = "onchain*.parquet" if layer == "factors" else "*.parquet"
+        for p in sorted(root.rglob(pattern)):
+            rows.append({
+                "layer": layer,
+                "source": p.parent.name if layer == "raw" else layer,
+                "table": p.stem,
+                "path": str(p),
+                "size_mb": round(p.stat().st_size / 1024 / 1024, 4),
+                "modified_at": pd.Timestamp.fromtimestamp(p.stat().st_mtime),
+            })
+        return pd.DataFrame(rows)
+
+    def get_onchain_data(
+        self,
+        table: str = "onchain_daily",
+        layer: str = "processed",
+        source: str | None = None,
+        start_date=None,
+        end_date=None,
+        columns=None,
+        as_index: bool = True,
+    ):
+        """
+        Query on-chain parquet data.
+
+        Common examples:
+            get_onchain_data()  # processed/onchain/onchain_daily.parquet
+            get_onchain_data("onchain_features", layer="factors")
+            get_onchain_data("defillama_daily")
+            get_onchain_data("chain_tvl_ethereum", layer="raw", source="defillama")
+        """
+        path = self._onchain_table_path(table=table, layer=layer, source=source)
+        if not path.exists():
+            print(f"[WARN] On-chain table not found: {path}")
+            return None
+
+        df = pd.read_parquet(path)
+        if df.empty:
+            return df
+
+        time_col = self._detect_onchain_time_col(df)
+        if time_col is None:
+            raise ValueError(f"On-chain table missing timestamp/day/date column: {path}")
+
+        df = df.copy()
+        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+        df = df.dropna(subset=[time_col])
+
+        if start_date is not None:
+            df = df[df[time_col] >= pd.to_datetime(start_date)]
+        if end_date is not None:
+            df = df[df[time_col] <= pd.to_datetime(end_date)]
+
+        if columns is not None:
+            if isinstance(columns, str):
+                columns = [columns]
+            selected = [time_col] + [c for c in columns if c != time_col]
+            missing = [c for c in selected if c not in df.columns]
+            if missing:
+                raise ValueError(f"Invalid on-chain columns: {missing}")
+            df = df[selected]
+
+        df = df.sort_values(time_col).reset_index(drop=True)
+        if as_index:
+            return df.set_index(time_col)
+        return df
+
+    def get_latest_onchain_row(
+        self,
+        table: str = "onchain_daily",
+        layer: str = "processed",
+        source: str | None = None,
+    ):
+        """Return the latest row of an on-chain table as a one-row DataFrame."""
+        df = self.get_onchain_data(table=table, layer=layer, source=source, as_index=False)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        time_col = self._detect_onchain_time_col(df)
+        return df.sort_values(time_col).tail(1).reset_index(drop=True)
+
+    def _onchain_root(self, layer: str, source: str | None = None) -> Path:
+        if layer not in {"processed", "raw", "factors"}:
+            raise ValueError("layer must be 'processed', 'raw', or 'factors'")
+        if layer == "processed":
+            return self.processed_onchain_dir
+        if layer == "factors":
+            return self.factors_dir
+        return self.raw_onchain_dir / source if source else self.raw_onchain_dir
+
+    def _onchain_table_path(self, table: str, layer: str, source: str | None = None) -> Path:
+        root = self._onchain_root(layer=layer, source=source)
+        path = root / table
+        if path.suffix != ".parquet":
+            path = path.with_suffix(".parquet")
+        return path
+
+    @staticmethod
+    def _detect_onchain_time_col(df: pd.DataFrame) -> str | None:
+        for col in ("timestamp", "day", "date", "time"):
+            if col in df.columns:
+                return col
+        return None
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@ derivatives funding features, live risk guard & OMS.
 """
 import numpy as np
 import pandas as pd
+import tempfile
+from pathlib import Path
 
 from crypto.schemas import FrozenConfig
 from crypto.adapters import to_bars_schema, decision_time_grid
@@ -15,6 +17,8 @@ from crypto.features.derivatives import funding_features
 from crypto.live.risk_guard import CircuitBreaker, CBLevel, check_staleness, signal_data_is_pit
 from crypto.live.oms import (Order, PaperBroker, OrderStatus, is_large_order,
                                 execute_twap, reconcile)
+from etl.data_loader import DataLoader
+from etl.onchain_feature_builder import build_onchain_factors
 
 
 def _synth_1h(n=24 * 120, seed=1):
@@ -65,6 +69,92 @@ def test_onchain_empty_graceful():
     dts = pd.date_range("2022-01-01", periods=10, freq="4h")
     feat = onchain_factors(None, dts)
     assert len(feat) == len(dts)   # degrades gracefully, no crash
+
+
+def test_data_loader_processed_onchain_query():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "onchain"
+        root.mkdir(parents=True)
+        pd.DataFrame({
+            "timestamp": pd.to_datetime(["2022-01-01", "2022-01-02"]),
+            "onchain_metric": [1.0, 2.0],
+            "other": [3.0, 4.0],
+        }).to_parquet(root / "onchain_daily.parquet", index=False)
+
+        loader = DataLoader()
+        loader.processed_onchain_dir = root
+        out = loader.get_onchain_data(
+            table="onchain_daily",
+            start_date="2022-01-02",
+            columns=["onchain_metric"],
+        )
+        tables = loader.list_onchain_tables(layer="processed")
+
+    assert isinstance(out.index, pd.DatetimeIndex)
+    assert len(out) == 1
+    assert "onchain_metric" in out.columns
+    assert "other" not in out.columns
+    assert tables["table"].tolist() == ["onchain_daily"]
+
+
+def test_data_loader_raw_defillama_onchain_query():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "onchain"
+        raw = root / "defillama"
+        raw.mkdir(parents=True)
+        pd.DataFrame({
+            "timestamp": pd.to_datetime(["2022-01-01", "2022-01-02"]),
+            "chain": ["Ethereum", "Ethereum"],
+            "tvl_usd": [10.0, 11.0],
+        }).to_parquet(raw / "chain_tvl_ethereum.parquet", index=False)
+
+        loader = DataLoader()
+        loader.raw_onchain_dir = root
+        out = loader.get_onchain_data(
+            table="chain_tvl_ethereum",
+            layer="raw",
+            source="defillama",
+            end_date="2022-01-01",
+            as_index=False,
+        )
+        latest = loader.get_latest_onchain_row(
+            table="chain_tvl_ethereum",
+            layer="raw",
+            source="defillama",
+        )
+
+    assert len(out) == 1
+    assert out.loc[0, "tvl_usd"] == 10.0
+    assert latest.loc[0, "tvl_usd"] == 11.0
+
+
+def test_onchain_factor_builder_keeps_derivatives_in_factors_layer():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        processed_path = root / "processed_onchain.parquet"
+        factor_path = root / "onchain_features.parquet"
+        pd.DataFrame({
+            "timestamp": pd.date_range("2022-01-01", periods=40, freq="D"),
+            "onchain_base_metric": np.arange(40, dtype=float) + 1.0,
+        }).to_parquet(processed_path, index=False)
+
+        out = build_onchain_factors(
+            processed_path=processed_path,
+            output_path=factor_path,
+            save=True,
+        )
+
+        loader = DataLoader()
+        loader.factors_dir = root
+        listed = loader.list_onchain_tables(layer="factors")
+        loaded = loader.get_onchain_data("onchain_features", layer="factors")
+
+    assert "onchain_base_metric" in out.columns
+    assert "onchain_base_metric_chg_1d" in out.columns
+    assert "onchain_base_metric_chg_7d" in out.columns
+    assert "onchain_base_metric_z_30d" in out.columns
+    assert listed["table"].tolist() == ["onchain_features"]
+    assert loaded is not None and not loaded.empty
 
 
 # ---- derivatives funding -------------------------------------------------- #

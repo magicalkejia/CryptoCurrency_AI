@@ -13,6 +13,7 @@ import crypto.skills.catalog  # noqa
 from crypto.agents.agents import new_state, RiskAgent, FusionAgent
 from crypto.orchestration.graph import TradingGraph, decision_to_json
 from crypto.live.oms import PaperBroker
+from etl.model_feature_loader import add_trading_graph_compat_columns
 
 
 # ---- fake bundle for isolated agent tests --------------------------------- #
@@ -89,6 +90,22 @@ def test_graph_quality_gate_degradation():
     # skill log should stop before fusion/execution
     skills = [r.skill for r in st["audit_log"]]
     assert "fusion_infer" not in skills and "execute_paper" not in skills
+
+
+def test_graph_feature_adapter_adds_legacy_aliases():
+    feats = pd.DataFrame({
+        "symbol": ["BTC/USDT"],
+        "decision_time": [pd.Timestamp("2022-01-01 12:01")],
+        "ret_24h": [0.01],
+        "vol_96h": [0.02],
+        "funding_rate_z_30_events": [1.5],
+        "max_feature_available_time": [pd.Timestamp("2022-01-01 12:00")],
+    })
+    out = add_trading_graph_compat_columns(feats)
+    assert out.loc[0, "vol_24"] == feats.loc[0, "vol_96h"]
+    assert out.loc[0, "mom_z"] == feats.loc[0, "ret_24h"]
+    assert out.loc[0, "funding_rate_z"] == feats.loc[0, "funding_rate_z_30_events"]
+    assert out.loc[0, "max_feature_availability_ts"] == feats.loc[0, "max_feature_available_time"]
 
 
 def test_graph_full_flow_audit_complete():

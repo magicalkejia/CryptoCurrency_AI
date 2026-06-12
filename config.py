@@ -82,6 +82,18 @@ class TargetConfig:
     }
 
 
+class OnchainConfig:
+    """On-chain / DeFi source configuration."""
+    SYMBOL_TO_DEFILLAMA_CHAIN = {
+        "BTC/USDT": "Bitcoin",
+        "ETH/USDT": "Ethereum",
+        "SOL/USDT": "Solana",
+        "BNB/USDT": "BSC",
+    }
+    DEFILLAMA_CHAINS = list(SYMBOL_TO_DEFILLAMA_CHAIN.values())
+    ONCHAIN_FACTOR_TABLE = "onchain_features.parquet"
+
+
 def init_directories():
     """初始化项目目录结构，应在程序启动时显式调用。"""
     paths_to_create = [
@@ -119,6 +131,6 @@ def init_directories():
     for p in paths_to_create:
         try:
             os.makedirs(p, exist_ok=True)
-            print(f"目录检查/创建成功: {p}")
+            # print(f"目录检查/创建成功: {p}")
         except Exception as e:
             print(f"目录创建失败 {p}: {e}")

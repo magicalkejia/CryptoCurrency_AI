@@ -26,7 +26,8 @@ Expected existing files:
     processed/derivatives/oi.parquet                         optional
     processed/flow/spot_cvd_4h.parquet                       optional
     processed/sentiment/x_sentiment_4h.parquet               optional
-    processed/onchain/onchain_daily.parquet                  optional
+    factors/onchain_features.parquet                        optional
+    processed/onchain/onchain_daily.parquet                  fallback only
 
 Output:
     factors/crypto_features.parquet
@@ -48,6 +49,7 @@ import numpy as np
 import pandas as pd
 
 import config
+from etl.feature_registry import get_feature_definitions
 
 
 
@@ -76,9 +78,9 @@ class FeatureBuilderConfig:
     include_1h_features: bool = True
     include_1d_features: bool = True
     include_funding: bool = True
-    include_oi: bool = True
-    include_cvd_proxy: bool = True
-    include_sentiment: bool = True
+    include_oi: bool = False
+    include_cvd_proxy: bool = False
+    include_sentiment: bool = False
     include_onchain: bool = True
 
     # Rolling windows.
@@ -135,6 +137,10 @@ def processed_sentiment_dir() -> Path:
 
 def processed_onchain_dir() -> Path:
     return _path_attr("PROCESSED_ONCHAIN", processed_dir() / "onchain")
+
+
+def onchain_factors_path() -> Path:
+    return factors_dir() / "onchain_features.parquet"
 
 
 def symbol_key(symbol: str) -> str:
@@ -310,7 +316,7 @@ def load_processed_kline(symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
     path = processed_dir() / f"{symbol_key(symbol)}_{timeframe}.parquet"
     df = _read_parquet_if_exists(path)
     if df is None:
-        print(f"⚠️ Missing processed kline: {path}")
+        print(f"[WARN] Missing processed kline: {path}")
         return None
     if df.empty:
         return df
@@ -484,7 +490,7 @@ def load_funding_features(cfg: FeatureBuilderConfig) -> Optional[pd.DataFrame]:
     path = processed_derivatives_dir() / "funding.parquet"
     df = _read_parquet_if_exists(path)
     if df is None:
-        print(f"⚠️ Funding feature source missing, skipped: {path}")
+        print(f"[WARN] Funding feature source missing, skipped: {path}")
         return None
     if df.empty:
         return df
@@ -512,7 +518,7 @@ def load_oi_features(cfg: FeatureBuilderConfig) -> Optional[pd.DataFrame]:
     path = processed_derivatives_dir() / "oi.parquet"
     df = _read_parquet_if_exists(path)
     if df is None:
-        print(f"⚠️ OI feature source missing, skipped: {path}")
+        print(f"[WARN] OI feature source missing, skipped: {path}")
         return None
     if df.empty:
         return df
@@ -552,7 +558,7 @@ def load_cvd_features(cfg: FeatureBuilderConfig) -> Optional[pd.DataFrame]:
     df = _read_parquet_if_exists(path)
     if df is None:
         # spot_cvd_proxy_4h may already be derived from market net_taker_vol.
-        print(f"⚠️ CVD source missing, skipped: {path}")
+        print(f"[WARN] CVD source missing, skipped: {path}")
         return None
     if df.empty:
         return df
@@ -584,7 +590,7 @@ def load_sentiment_features(cfg: FeatureBuilderConfig) -> Optional[pd.DataFrame]
     path = processed_sentiment_dir() / "x_sentiment_4h.parquet"
     df = _read_parquet_if_exists(path)
     if df is None:
-        print(f"⚠️ Sentiment source missing, skipped: {path}")
+        print(f"[WARN] Sentiment source missing, skipped: {path}")
         return None
     if df.empty:
         return df
@@ -609,17 +615,23 @@ def load_sentiment_features(cfg: FeatureBuilderConfig) -> Optional[pd.DataFrame]
 
 
 def load_onchain_features(cfg: FeatureBuilderConfig) -> Optional[pd.DataFrame]:
-    path = processed_onchain_dir() / "onchain_daily.parquet"
+    path = onchain_factors_path()
+    if not path.exists():
+        fallback = processed_onchain_dir() / "onchain_daily.parquet"
+        if fallback.exists():
+            print(f"[WARN] On-chain factors missing, using processed fallback: {fallback}")
+            path = fallback
+
     df = _read_parquet_if_exists(path)
     if df is None:
-        print(f"⚠️ On-chain source missing, skipped: {path}")
+        print(f"[WARN] On-chain source missing, skipped: {path}")
         return None
     if df.empty:
         return df
 
     time_col = "timestamp" if "timestamp" in df.columns else "day" if "day" in df.columns else None
     if time_col is None:
-        print(f"⚠️ On-chain source missing timestamp/day column, skipped: {path}")
+        print(f"[WARN] On-chain source missing timestamp/day column, skipped: {path}")
         return None
 
     df = _ensure_timestamp(df.rename(columns={time_col: "timestamp"}), "timestamp")
@@ -678,7 +690,7 @@ def validate_pit_features(features: pd.DataFrame, strict: bool = True) -> pd.Dat
             msg = f"PIT violation: feature available_time exceeds decision_time:\n{sample}"
             if strict:
                 raise ValueError(msg)
-            print(f"⚠️ {msg}")
+            print(f"[WARN] {msg}")
     else:
         features = features.copy()
         features["max_feature_available_time"] = pd.NaT
@@ -799,7 +811,7 @@ def build_crypto_features(
         out_path = Path(output_path) if output_path is not None else factors_dir() / cfg.output_name
         out_path.parent.mkdir(parents=True, exist_ok=True)
         features.to_parquet(out_path, engine="pyarrow", compression="zstd", index=False)
-        print(f"💾 Saved crypto PIT features: {out_path} ({len(features)} rows, {len(features.columns)} columns)")
+        print(f"saved crypto PIT features: {out_path} ({len(features)} rows, {len(features.columns)} columns)")
 
     return features
 
