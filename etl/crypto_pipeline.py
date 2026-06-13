@@ -7,7 +7,7 @@ Top-level crypto data orchestration.
 This module should not contain source-specific business logic. It coordinates:
     raw fetchers      -> data_updater.py / onchain_updater.py
     processors        -> data_processor.py / onchain_processor.py
-    factor builders   -> onchain_feature_builder.py / feature_builder_H.py
+    factor builders   -> onchain_feature_builder.py / feature_builder.py
 
 The collaborator's current market-only path remains the default. Optional
 on-chain and multimodal feature steps are opt-in so the draft can still run fast.
@@ -216,7 +216,7 @@ def _build_model_features(cfg: CryptoPipelineConfig) -> dict:
     if cfg.feature_builder != "multimodal":
         raise ValueError(f"Unsupported feature_builder: {cfg.feature_builder}")
 
-    from etl.feature_builder_H import FeatureBuilderConfig, build_crypto_features
+    from etl.feature_builder import FeatureBuilderConfig, build_crypto_features
 
     fcfg = FeatureBuilderConfig()
     features = build_crypto_features(
@@ -226,7 +226,7 @@ def _build_model_features(cfg: CryptoPipelineConfig) -> dict:
         output_path=cfg.feature_output_path,
     )
     return {
-        "builder": "feature_builder_H",
+        "builder": "feature_builder",
         "rows": len(features),
         "cols": len(features.columns),
         "output_path": cfg.feature_output_path or str(config.PathConfig.FACTORS / fcfg.output_name),

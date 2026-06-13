@@ -13,7 +13,7 @@ Data contract (matches your processed parquet):
     funding (hook)  : {SYMBOL}_funding.parquet (optional; auto-detected when ready)
 
 Pipeline (all reuse existing project functions; nothing re-implemented):
-  1. multi-timeframe PIT dataset  (etl.feature_builder.build_market_dataset)
+  1. multi-timeframe PIT dataset  (etl.dataset_builder.build_market_dataset)
   2. PIT leakage audit            (crypto.pit.audit_lookahead)
   3. incremental proof ladder     (crypto.experiments.incremental_study) — onchain/
      narrative auto-skipped until the colleague's data arrives
@@ -46,7 +46,7 @@ import pandas as pd
 import config
 from crypto.schemas import FrozenConfig, environment_hash, make_audit_id
 from crypto.adapters import to_bars_schema
-from etl.feature_builder import build_market_dataset
+from etl.dataset_builder import build_market_dataset, DEFAULT_FEATURE_SET
 from crypto.pipeline_1b import run_phase1b
 from crypto.experiments.incremental_study import run_incremental_study
 from crypto.experiments.patchtst_ablation import run_ablation, _oof_alpha
@@ -318,6 +318,9 @@ def main():
     ap.add_argument("--outdir", default=None, help="output dir (default: data_storage/experiments/<ts>)")
     ap.add_argument("--holdout_frac", type=float, default=0.2, help="final holdout fraction (frozen)")
     ap.add_argument("--patchtst_emb_dim", type=int, default=8)
+    ap.add_argument("--feature_set", default=DEFAULT_FEATURE_SET,
+                    help="registry model feature set (market_core_v1 | market_plus_funding_v1 | "
+                         "market_plus_onchain_v1 | market_plus_funding_onchain_v1)")
     ap.add_argument("--smooth_bars", type=int, default=6,
                     help="EMA span for position smoothing (low turnover). ~1 day at 4h.")
     ap.add_argument("--deadband", type=float, default=0.05,
@@ -343,6 +346,7 @@ def main():
     print(f" config_hash={fcfg.config_hash()}   env={environment_hash()}")
     print(f" deployment: smooth_bars={args.smooth_bars} deadband={args.deadband} "
           f"max_pos={fcfg.risk.max_pos_per_symbol} (low-turnover)")
+    print(f" feature_set={args.feature_set}")
     print(f" label barriers: tp={fcfg.label.tp_mult} sl={fcfg.label.sl_mult}"
           f"{'  [SYMMETRIC]' if fcfg.label.tp_mult == fcfg.label.sl_mult else ''}")
     print(f" mode={'SYNTHETIC (wiring check)' if args.synthetic else 'REAL parquet'}"
@@ -359,13 +363,22 @@ def main():
             return to_bars_schema(_synthetic_bars(seeds[sym], tf), tf)
 
     md = build_market_dataset(args.symbols, fcfg, patchtst_emb_dim=args.patchtst_emb_dim,
-                              bars_provider=provider)
+                              bars_provider=provider, feature_set=args.feature_set,
+                              synthetic=args.synthetic)
     print("\n[1] DATASET")
     for s, info in md.per_symbol.items():
+        if s.startswith("_"):
+            continue
         print(f"    {s}: {info}")
     print(f"    rows={len(md.dataset)}  market_feats={len(md.tabular_cols)}  "
+          f"onchain_feats={len(md.modality_cols['onchain'])}  "
           f"patchtst_feats={len(md.modality_cols['patchtst'])}  total_feats={len(md.feature_cols)}")
     print(f"    market columns : {md.tabular_cols}")
+    if md.modality_cols["onchain"]:
+        oc = md.per_symbol.get("_onchain", {})
+        print(f"    onchain columns: {md.modality_cols['onchain']}")
+        print(f"    onchain coverage: {oc.get('rows_with_onchain', 0)} rows "
+              f"(real DefiLlama data from {oc.get('onchain_start', 'n/a')})")
 
     print("\n[2] PIT LEAKAGE AUDIT")
     print(f"    future_function_checks_passed = {md.audit['future_function_checks_passed']}  "

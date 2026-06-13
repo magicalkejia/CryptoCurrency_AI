@@ -38,7 +38,7 @@ import pandas as pd
 from crypto.cv.purged_kfold import purged_embargoed_splits, default_embargo_delta
 from crypto.models.base_lgb import MultiClassLearner, BinaryLearner
 from crypto.labels.meta_label import build_meta_label
-from crypto.benchmark.tsmom import vol_parity_tsmom_weights
+from crypto.benchmark.tsmom import vol_parity_tsmom_weights, vol_parity_weights_from_signal
 from crypto.eval.significance import (newey_west_tstat, deflated_sharpe_ratio,
                                       information_coefficient, block_bootstrap_sharpe)
 from backtest.engine import run_vector_backtest, BacktestConfig
@@ -80,26 +80,34 @@ def _cost_rates(fcfg):
     return 0.0004, 0.0004
 
 
-def _alpha_to_weight_panel(df, alpha, close_panel, max_pos, fcfg,
+def _alpha_to_weight_panel(df, alpha, close_panel, fcfg, bars_per_year,
                            smooth_bars=1, deadband=0.0, meta_prob=None, p_threshold=0.55):
-    """Build a LOW-TURNOVER, CONVICTION-SIZED target-weight panel from an OOF alpha.
-      * conviction -> position size scales with |alpha| (capped at max_pos when
-        |alpha| >= edge_cap), so weak signals get small positions, strong ones full.
-      * deadband   -> ignore |alpha| < deadband (no trade on weak signal)
-      * meta gate  -> flat when meta_prob <= p_threshold
-      * smoothing  -> EMA the target weight over `smooth_bars` (hold ~horizon)."""
+    """Deploy an OOF alpha through the SAME volatility-parity risk engine as the
+    TSMOM baseline (inverse-vol weighting + covariance vol-targeting + gross cap),
+    so the ML signal sits on an equal risk footing with the benchmark instead of
+    naive per-symbol position sizing. Sizing is by CONVICTION:
+      * per-symbol signed conviction in [-1, 1] scales with |alpha| (full at
+        |alpha| >= edge_cap); weak signals get small exposure.
+      * deadband  -> conviction 0 when |alpha| < deadband (no trade on weak signal)
+      * meta gate -> conviction 0 when meta_prob <= p_threshold
+      * smoothing -> EMA the conviction over `smooth_bars` (hold ~horizon)
+    The vol-parity engine then turns the conviction panel into target weights."""
     scale = fcfg.risk.edge_cap if fcfg is not None else 0.2
     a = np.nan_to_num(alpha)
-    conviction = np.clip(np.abs(a) / max(scale, 1e-9), 0.0, 1.0)        # in [0,1]
-    raw = (np.abs(a) >= deadband).astype(float) * np.sign(a) * conviction * max_pos
+    conviction = np.sign(a) * np.clip(np.abs(a) / max(scale, 1e-9), 0.0, 1.0)   # in [-1, 1]
+    conviction = np.where(np.abs(a) >= deadband, conviction, 0.0)
     if meta_prob is not None:
-        raw = raw * (np.nan_to_num(meta_prob) > p_threshold).astype(float)
+        conviction = conviction * (np.nan_to_num(meta_prob) > p_threshold).astype(float)
     tmp = df[["symbol", "decision_time"]].copy()
-    tmp["w"] = raw
-    w = tmp.pivot_table(index="decision_time", columns="symbol", values="w", aggfunc="last").fillna(0)
+    tmp["c"] = conviction
+    cpanel = tmp.pivot_table(index="decision_time", columns="symbol", values="c",
+                             aggfunc="last").fillna(0.0)
     if smooth_bars and smooth_bars > 1:
-        w = w.ewm(span=int(smooth_bars), adjust=False).mean()           # position persistence
-    return w
+        cpanel = cpanel.ewm(span=int(smooth_bars), adjust=False).mean()         # conviction persistence
+    close = close_panel.reindex(cpanel.index).ffill()
+    gross_cap = fcfg.risk.gross_cap if fcfg is not None else 1.0
+    return vol_parity_weights_from_signal(close, cpanel, vol_window=30, cov_window=30,
+                                          bars_per_year=bars_per_year, gross_cap=gross_cap)
 
 
 def _panel_to_returns(close_panel, w, bars_per_year, fcfg):
@@ -115,12 +123,12 @@ def _panel_to_returns(close_panel, w, bars_per_year, fcfg):
             float(res["cost"].mean() * bars_per_year))
 
 
-def _alpha_to_returns(df, alpha, close_panel, bars_per_year, max_pos,
+def _alpha_to_returns(df, alpha, close_panel, bars_per_year,
                       meta_prob=None, p_threshold=0.55, fcfg=None,
                       smooth_bars=1, deadband=0.0):
-    """Conviction-sized, low-turnover deployment of an OOF alpha.
+    """Vol-parity, conviction-sized deployment of an OOF alpha.
     Returns (returns, ann_turnover, ann_cost_fraction)."""
-    w = _alpha_to_weight_panel(df, alpha, close_panel, max_pos, fcfg,
+    w = _alpha_to_weight_panel(df, alpha, close_panel, fcfg, bars_per_year,
                                smooth_bars=smooth_bars, deadband=deadband,
                                meta_prob=meta_prob, p_threshold=p_threshold)
     return _panel_to_returns(close_panel, w, bars_per_year, fcfg)
@@ -208,12 +216,16 @@ def run_incremental_study(
     oc = modality_cols.get("onchain", [])
     nv = modality_cols.get("narrative", [])
     pt = modality_cols.get("patchtst", [])
+    # PatchTST: the forecast head is non-predictive (ablation config B) and dilutes
+    # the tree; the embedding (config C) is the only part worth concatenating, and
+    # C beats the full set D. Step4 therefore adds the EMBEDDING ONLY.
+    pt_emb = [c for c in pt if "patchtst_emb_" in c] or pt
 
     if max_pos is None:
         max_pos = fcfg.risk.max_pos_per_symbol
 
     def deploy(a, meta=None):
-        return _alpha_to_returns(df, a, close_panel, bars_per_year, max_pos,
+        return _alpha_to_returns(df, a, close_panel, bars_per_year,
                                  meta_prob=meta, p_threshold=fcfg.risk.p_threshold, fcfg=fcfg,
                                  smooth_bars=smooth_bars, deadband=deadband)
 
@@ -223,7 +235,7 @@ def run_incremental_study(
 
     cumulative = []
     for name, group in [("Step1_market", mk), ("Step2_+onchain", oc),
-                        ("Step3_+narrative", nv), ("Step4_+patchtst", pt)]:
+                        ("Step3_+narrative", nv), ("Step4_+patchtst", pt_emb)]:
         new_cols = [c for c in group if c in df.columns]
         if not new_cols:                      # modality has no data -> carry previous
             steps.append((name, None, None, np.nan, np.nan))
@@ -233,9 +245,11 @@ def run_incremental_study(
         r, tn, cs = deploy(a)
         steps.append((name, a, r, tn, cs))
 
-    # Step5 fusion (mean of per-modality OOF alphas)
+    # Step5 fusion (mean of per-modality OOF alphas). PatchTST is EXCLUDED from the
+    # fusion: its standalone signal is ~0 (ablation B) so averaging it in only
+    # dilutes the strong market+onchain alpha. Fusion = market + onchain (+ narrative).
     fused, base_oof = _fusion_alpha(df, {"market": mk, "onchain": oc,
-                                         "narrative": nv, "patchtst": pt}, fcfg, splits)
+                                         "narrative": nv}, fcfg, splits)
     r5, t5, c5 = deploy(fused)
     steps.append(("Step5_fusion", fused, r5, t5, c5))
 
@@ -247,7 +261,7 @@ def run_incremental_study(
     # Step7 TSMOM fusion: COMBINE (not replace) the strong momentum baseline with
     # the meta-gated ML signal via a fixed 50/50 convex blend of their weight panels.
     # beta=0.5 is a neutral prior (not tuned to Sharpe).
-    w_ml = _alpha_to_weight_panel(df, fused, close_panel, max_pos, fcfg,
+    w_ml = _alpha_to_weight_panel(df, fused, close_panel, fcfg, bars_per_year,
                                   smooth_bars=smooth_bars, deadband=deadband,
                                   meta_prob=meta_prob, p_threshold=fcfg.risk.p_threshold)
     w_ts = _tsmom_weight_panel(close_panel, bars_per_year)
