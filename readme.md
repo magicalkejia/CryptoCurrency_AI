@@ -120,6 +120,42 @@ python -m ipykernel install --user --name=quant_system --display-name="Quant Sys
 ```
 python main.py
 ```
+
+### 日常维护：
+
+有新依赖时，上面的pip install -e .也行
+
+```
+task sysrun 
 ```
 
+要手动更新数据时：
+
+如果增加新的币种： config.py里面 coin 列表添加对应的合约（记得核实币安接口是否有）
+
+随后输入：
+
+```
+task dataupdate
+```
+
+如果只需要纯K线数据（OHLC） 
+
+```
+task marketonly_dataupdate
+```
+
+如果要更新链上数据：
+
+```
+task onchain_dataupdate
+```
+
+如果想要构建特征集：
+
+1. 可以直接运行feature_builder.py 配置在文件最上方
+2. 终端输入如下命令：
+
+```
+task feature
 ```
