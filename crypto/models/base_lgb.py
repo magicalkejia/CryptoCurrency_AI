@@ -69,11 +69,17 @@ class MultiClassLearner:
             self.model = lgb.LGBMClassifier(
                 n_estimators=self.cfg.n_estimators, max_depth=self.cfg.max_depth,
                 learning_rate=self.cfg.learning_rate, random_state=self.cfg.random_seed,
-                verbose=-1, min_child_samples=5)
+                verbose=-1, min_child_samples=getattr(self.cfg, "min_child_samples", 5),
+                subsample=getattr(self.cfg, "subsample", 1.0),
+                colsample_bytree=getattr(self.cfg, "colsample_bytree", 1.0),
+                reg_alpha=getattr(self.cfg, "reg_alpha", 0.0),
+                reg_lambda=getattr(self.cfg, "reg_lambda", 0.0))
         else:
             self.model = GradientBoostingClassifier(
                 n_estimators=self.cfg.n_estimators, max_depth=self.cfg.max_depth,
-                learning_rate=self.cfg.learning_rate, random_state=self.cfg.random_seed)
+                learning_rate=self.cfg.learning_rate, random_state=self.cfg.random_seed,
+                subsample=getattr(self.cfg, "subsample", 1.0),
+                min_samples_leaf=getattr(self.cfg, "min_child_samples", 5))
         self.model.fit(Xdf, y, sample_weight=sample_weight)
         self.classes_ = self.model.classes_
         return self
@@ -112,7 +118,11 @@ class BinaryLearner:
             self.model = lgb.LGBMClassifier(
                 n_estimators=self.cfg.n_estimators, max_depth=self.cfg.max_depth,
                 learning_rate=self.cfg.learning_rate, random_state=self.cfg.random_seed,
-                verbose=-1, min_child_samples=5)
+                verbose=-1, min_child_samples=getattr(self.cfg, "min_child_samples", 5),
+                subsample=getattr(self.cfg, "subsample", 1.0),
+                colsample_bytree=getattr(self.cfg, "colsample_bytree", 1.0),
+                reg_alpha=getattr(self.cfg, "reg_alpha", 0.0),
+                reg_lambda=getattr(self.cfg, "reg_lambda", 0.0))
         else:
             self.model = LogisticRegression(max_iter=1000, random_state=self.cfg.random_seed)
         self.model.fit(Xdf, y, sample_weight=sample_weight)

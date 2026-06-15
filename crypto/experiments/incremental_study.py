@@ -80,19 +80,43 @@ def _cost_rates(fcfg):
     return 0.0004, 0.0004
 
 
+def _apply_no_trade_band(w: pd.DataFrame, band: float) -> pd.DataFrame:
+    """Turnover control: hysteresis on the final weights — only move a symbol's
+    weight when the new target differs from the held weight by more than `band`.
+    This cuts churn from per-bar vol/cov rescaling without abandoning risk
+    management. Principled (cost-based) lever, not tuned to Sharpe."""
+    arr = w.to_numpy(dtype=float)
+    out = np.zeros_like(arr)
+    prev = np.zeros(arr.shape[1], dtype=float)
+    for i in range(len(arr)):
+        tgt = arr[i]
+        move = np.abs(tgt - prev) > band
+        prev = np.where(move, tgt, prev)
+        out[i] = prev
+    return pd.DataFrame(out, index=w.index, columns=w.columns)
+
+
 def _alpha_to_weight_panel(df, alpha, close_panel, fcfg, bars_per_year,
-                           smooth_bars=1, deadband=0.0, meta_prob=None, p_threshold=0.55):
-    """Deploy an OOF alpha through the SAME volatility-parity risk engine as the
-    TSMOM baseline (inverse-vol weighting + covariance vol-targeting + gross cap),
-    so the ML signal sits on an equal risk footing with the benchmark instead of
-    naive per-symbol position sizing. Sizing is by CONVICTION:
-      * per-symbol signed conviction in [-1, 1] scales with |alpha| (full at
-        |alpha| >= edge_cap); weak signals get small exposure.
-      * deadband  -> conviction 0 when |alpha| < deadband (no trade on weak signal)
-      * meta gate -> conviction 0 when meta_prob <= p_threshold
-      * smoothing -> EMA the conviction over `smooth_bars` (hold ~horizon)
-    The vol-parity engine then turns the conviction panel into target weights."""
+                           smooth_bars=1, deadband=0.0, meta_prob=None, p_threshold=0.55,
+                           deploy_mode="vol_parity", max_vol_scale=3.0, no_trade_band=0.0):
+    """Deploy an OOF alpha as a target-weight panel. Sizing is by CONVICTION
+    (per-symbol signed conviction in [-1, 1] that scales with |alpha|, full at
+    |alpha| >= edge_cap), with a no-trade deadband, optional meta gate, and EMA
+    persistence. Deployment modes (selectable for A/B comparison):
+      * "vol_parity" (default): route the conviction panel through the SAME
+        inverse-vol + covariance vol-target + gross-cap engine as TSMOM.
+      * "simple": naive per-symbol sizing (conviction * max_pos_per_symbol), no
+        vol-parity (the quant reviewer's proposal; kept for comparison).
+      * "xs_neutral": cross-sectional market-neutral. Remove the common (market)
+        component at each timestamp so the book bets on RELATIVE strength across
+        symbols (long the strongest / short the weakest), dollar-neutral, gross
+        normalized to gross_cap. This strips the dominant common (BTC) factor and
+        raises effective breadth -- the structural lever for the breadth limit.
+    `no_trade_band` applies a final-weight hysteresis (turnover control).
+    `max_vol_scale` caps the low-vol leverage of the vol-parity engine."""
     scale = fcfg.risk.edge_cap if fcfg is not None else 0.2
+    max_pos = fcfg.risk.max_pos_per_symbol if fcfg is not None else 0.25
+    gross_cap = fcfg.risk.gross_cap if fcfg is not None else 1.0
     a = np.nan_to_num(alpha)
     conviction = np.sign(a) * np.clip(np.abs(a) / max(scale, 1e-9), 0.0, 1.0)   # in [-1, 1]
     conviction = np.where(np.abs(a) >= deadband, conviction, 0.0)
@@ -104,10 +128,25 @@ def _alpha_to_weight_panel(df, alpha, close_panel, fcfg, bars_per_year,
                              aggfunc="last").fillna(0.0)
     if smooth_bars and smooth_bars > 1:
         cpanel = cpanel.ewm(span=int(smooth_bars), adjust=False).mean()         # conviction persistence
-    close = close_panel.reindex(cpanel.index).ffill()
-    gross_cap = fcfg.risk.gross_cap if fcfg is not None else 1.0
-    return vol_parity_weights_from_signal(close, cpanel, vol_window=30, cov_window=30,
-                                          bars_per_year=bars_per_year, gross_cap=gross_cap)
+
+    if deploy_mode == "simple":
+        w = cpanel * max_pos                                                    # naive per-symbol sizing
+    elif deploy_mode == "xs_neutral":
+        c_xs = cpanel.sub(cpanel.mean(axis=1), axis=0)                          # remove common factor -> market neutral
+        gross = c_xs.abs().sum(axis=1).replace(0.0, np.nan)
+        w = c_xs.div(gross, axis=0).fillna(0.0) * gross_cap                     # dollar-neutral, gross=gross_cap
+        if smooth_bars and smooth_bars > 1:
+            w = w.ewm(span=int(smooth_bars), adjust=False).mean()               # damp cross-sectional rank-flip churn (turnover control)
+    else:
+        close = close_panel.reindex(cpanel.index).ffill()
+        w = vol_parity_weights_from_signal(close, cpanel, vol_window=30, cov_window=30,
+                                            bars_per_year=bars_per_year, gross_cap=gross_cap,
+                                            max_vol_scale=max_vol_scale)
+    if no_trade_band and no_trade_band > 0:
+        w = _apply_no_trade_band(w, no_trade_band)
+    if deploy_mode == "xs_neutral":
+        w = w.sub(w.mean(axis=1), axis=0)                                      # re-enforce dollar-neutrality after band
+    return w
 
 
 def _panel_to_returns(close_panel, w, bars_per_year, fcfg):
@@ -125,12 +164,15 @@ def _panel_to_returns(close_panel, w, bars_per_year, fcfg):
 
 def _alpha_to_returns(df, alpha, close_panel, bars_per_year,
                       meta_prob=None, p_threshold=0.55, fcfg=None,
-                      smooth_bars=1, deadband=0.0):
-    """Vol-parity, conviction-sized deployment of an OOF alpha.
+                      smooth_bars=1, deadband=0.0,
+                      deploy_mode="vol_parity", max_vol_scale=3.0, no_trade_band=0.0):
+    """Conviction-sized deployment of an OOF alpha.
     Returns (returns, ann_turnover, ann_cost_fraction)."""
     w = _alpha_to_weight_panel(df, alpha, close_panel, fcfg, bars_per_year,
                                smooth_bars=smooth_bars, deadband=deadband,
-                               meta_prob=meta_prob, p_threshold=p_threshold)
+                               meta_prob=meta_prob, p_threshold=p_threshold,
+                               deploy_mode=deploy_mode, max_vol_scale=max_vol_scale,
+                               no_trade_band=no_trade_band)
     return _panel_to_returns(close_panel, w, bars_per_year, fcfg)
 
 
@@ -197,6 +239,9 @@ def run_incremental_study(
     max_pos: float = None,
     smooth_bars: int = 6,
     deadband: float = 0.05,
+    deploy_mode: str = "vol_parity",
+    max_vol_scale: float = 3.0,
+    no_trade_band: float = 0.0,
     kind: str = "exploratory",
 ) -> pd.DataFrame:
     """
@@ -227,7 +272,9 @@ def run_incremental_study(
     def deploy(a, meta=None):
         return _alpha_to_returns(df, a, close_panel, bars_per_year,
                                  meta_prob=meta, p_threshold=fcfg.risk.p_threshold, fcfg=fcfg,
-                                 smooth_bars=smooth_bars, deadband=deadband)
+                                 smooth_bars=smooth_bars, deadband=deadband,
+                                 deploy_mode=deploy_mode, max_vol_scale=max_vol_scale,
+                                 no_trade_band=no_trade_band)
 
     steps = []  # (name, alpha_or_None, returns, ann_turnover, ann_cost)
     r0, t0, c0 = _tsmom_returns(close_panel, bars_per_year, fcfg)
@@ -263,7 +310,9 @@ def run_incremental_study(
     # beta=0.5 is a neutral prior (not tuned to Sharpe).
     w_ml = _alpha_to_weight_panel(df, fused, close_panel, fcfg, bars_per_year,
                                   smooth_bars=smooth_bars, deadband=deadband,
-                                  meta_prob=meta_prob, p_threshold=fcfg.risk.p_threshold)
+                                  meta_prob=meta_prob, p_threshold=fcfg.risk.p_threshold,
+                                  deploy_mode=deploy_mode, max_vol_scale=max_vol_scale,
+                                  no_trade_band=no_trade_band)
     w_ts = _tsmom_weight_panel(close_panel, bars_per_year)
     idx = w_ts.index.union(w_ml.index)
     cols = w_ts.columns.union(w_ml.columns)

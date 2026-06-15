@@ -325,6 +325,30 @@ def main():
                     help="EMA span for position smoothing (low turnover). ~1 day at 4h.")
     ap.add_argument("--deadband", type=float, default=0.05,
                     help="ignore |alpha| below this (no trade on weak signal)")
+    ap.add_argument("--deploy_mode", choices=["vol_parity", "simple", "xs_neutral"], default="vol_parity",
+                    help="vol_parity = inverse-vol + covariance vol-target (same engine as TSMOM); "
+                         "simple = naive per-symbol conviction*max_pos (reviewer's proposal, for A/B); "
+                         "xs_neutral = cross-sectional dollar-neutral (long strongest/short weakest, "
+                         "removes common BTC factor -> raises breadth)")
+    ap.add_argument("--max_vol_scale", type=float, default=3.0,
+                    help="cap on low-vol leverage of the vol-parity engine (lower -> less turnover; "
+                         "1.0 = no leverage)")
+    ap.add_argument("--no_trade_band", type=float, default=0.0,
+                    help="final-weight hysteresis band (e.g. 0.05): only rebalance a symbol when its "
+                         "target weight moves more than this (turnover control)")
+    ap.add_argument("--p_threshold", type=float, default=None,
+                    help="override meta-gate probability threshold (default 0.55 from RiskConfig); "
+                         "changes config_hash")
+    # model-capacity / regularization overrides (change config_hash; judge by OOF
+    # IC_NW_t / DSR / PBO, NOT by dev Sharpe)
+    ap.add_argument("--n_estimators", type=int, default=None)
+    ap.add_argument("--max_depth", type=int, default=None)
+    ap.add_argument("--learning_rate", type=float, default=None)
+    ap.add_argument("--min_child_samples", type=int, default=None)
+    ap.add_argument("--subsample", type=float, default=None)
+    ap.add_argument("--colsample_bytree", type=float, default=None)
+    ap.add_argument("--reg_alpha", type=float, default=None)
+    ap.add_argument("--reg_lambda", type=float, default=None)
     ap.add_argument("--tp_mult", type=float, default=None,
                     help="override take-profit barrier (ATR mult). Symmetric labels: --tp_mult 1.5 --sl_mult 1.5")
     ap.add_argument("--sl_mult", type=float, default=None, help="override stop-loss barrier (ATR mult)")
@@ -337,6 +361,13 @@ def main():
         fcfg = replace(fcfg, label=replace(fcfg.label,
                                            tp_mult=args.tp_mult if args.tp_mult is not None else fcfg.label.tp_mult,
                                            sl_mult=args.sl_mult if args.sl_mult is not None else fcfg.label.sl_mult))
+    if args.p_threshold is not None:   # meta-gate threshold knob -> new config_hash (logged)
+        fcfg = replace(fcfg, risk=replace(fcfg.risk, p_threshold=args.p_threshold))
+    _mo = {k: getattr(args, k) for k in ("n_estimators", "max_depth", "learning_rate",
+            "min_child_samples", "subsample", "colsample_bytree", "reg_alpha", "reg_lambda")
+           if getattr(args, k) is not None}
+    if _mo:   # model-capacity overrides -> new config_hash (logged)
+        fcfg = replace(fcfg, model=replace(fcfg.model, **_mo))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     outdir = Path(args.outdir) if args.outdir else Path(config.PathConfig.EXPERIMENTS) / stamp
     outdir.mkdir(parents=True, exist_ok=True)
@@ -347,6 +378,8 @@ def main():
     print(f" deployment: smooth_bars={args.smooth_bars} deadband={args.deadband} "
           f"max_pos={fcfg.risk.max_pos_per_symbol} (low-turnover)")
     print(f" feature_set={args.feature_set}")
+    print(f" deploy_mode={args.deploy_mode} max_vol_scale={args.max_vol_scale} "
+          f"no_trade_band={args.no_trade_band} p_threshold={fcfg.risk.p_threshold}")
     print(f" label barriers: tp={fcfg.label.tp_mult} sl={fcfg.label.sl_mult}"
           f"{'  [SYMMETRIC]' if fcfg.label.tp_mult == fcfg.label.sl_mult else ''}")
     print(f" mode={'SYNTHETIC (wiring check)' if args.synthetic else 'REAL parquet'}"
@@ -401,7 +434,9 @@ def main():
     # ---- 2. incremental ladder (DEV ONLY) ----
     print("\n[3] INCREMENTAL PROOF LADDER (Step0 -> Step7)  [dev only]")
     ladder = run_incremental_study(dev, dev_close, md.modality_cols, fcfg, bars_per_year=BARS_PER_YEAR_4H,
-                                   smooth_bars=args.smooth_bars, deadband=args.deadband)
+                                   smooth_bars=args.smooth_bars, deadband=args.deadband,
+                                   deploy_mode=args.deploy_mode, max_vol_scale=args.max_vol_scale,
+                                   no_trade_band=args.no_trade_band)
     pd.set_option("display.width", 180, "display.max_columns", 20)
     print(ladder.round(4).to_string())
     ladder.to_csv(outdir / "incremental_ladder.csv")

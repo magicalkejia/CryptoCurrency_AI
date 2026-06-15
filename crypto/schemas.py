@@ -69,6 +69,13 @@ class ModelConfig:
     n_estimators: int = 200
     max_depth: int = 4
     learning_rate: float = 0.05
+    # capacity / regularization knobs (defaults preserve current behavior so the
+    # config_hash is unchanged unless a knob is explicitly overridden)
+    min_child_samples: int = 5
+    subsample: float = 1.0
+    colsample_bytree: float = 1.0
+    reg_alpha: float = 0.0
+    reg_lambda: float = 0.0
 
 
 @dataclass(frozen=True)
