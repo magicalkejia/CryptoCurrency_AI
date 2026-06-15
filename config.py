@@ -68,13 +68,39 @@ class SpiderConfig:
 
 class TargetConfig:
     """交易标的配置。"""
-    COINS = [
+    # Default trading universe for pooled cross-sectional crypto modeling.
+    # Keep this list focused on Binance USDT-margined perpetuals with broad
+    # history and different narrative / sector drivers.
+    DIVERSIFIED_10_COINS = [
         "BTC/USDT",
         "ETH/USDT",
         "SOL/USDT",
         "BNB/USDT",
-        # ...
+        "XRP/USDT",
+        "DOGE/USDT",
+        "LTC/USDT",
+        "LINK/USDT",
+        "TRX/USDT",
+        "ADA/USDT",
     ]
+
+    # Research candidates mentioned for lower BTC correlation checks. Keep
+    # them out of the default universe until availability/history is verified.
+    EXTRA_DIVERSIFICATION_CANDIDATES = [
+        "HYPE/USDT",
+        "XMR/USDT",
+        "ZEC/USDT",
+    ]
+
+    # Not a Binance USDM perpetual symbol. Treat as a future macro/cash-regime
+    # proxy only if a separate data source is added.
+    CASH_REGIME_PROXIES = [
+        "USDT.D",
+    ]
+
+    DATA_TEST_COINS = DIVERSIFIED_10_COINS + EXTRA_DIVERSIFICATION_CANDIDATES
+
+    COINS = DIVERSIFIED_10_COINS.copy()
 
     TIMEFRAMES = {
         "base": "1m",
