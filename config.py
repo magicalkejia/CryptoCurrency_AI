@@ -120,6 +120,43 @@ class OnchainConfig:
     ONCHAIN_FACTOR_TABLE = "onchain_features.parquet"
 
 
+class SentimentConfig:
+    """News/social sentiment source configuration."""
+
+    GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
+    GDELT_OUTPUT_NAME = "gdelt_articles.parquet"
+    GDELT_MAX_RECORDS = 250
+    GDELT_WINDOW_HOURS = 24
+    GDELT_SLEEP_SECONDS = 2.0
+    GDELT_RETRIES = 3
+    GDELT_BACKOFF_SECONDS = 10.0
+    GDELT_USE_PROXY = os.getenv("GDELT_USE_PROXY", "true").lower() == "true"
+    GDELT_DEFAULT_LOOKBACK_DAYS = 7
+
+    # GDELT is keyword-based news search, so avoid ambiguous tickers where
+    # possible and include project names.
+    GDELT_SYMBOL_QUERIES = {
+        "BTC/USDT": '(bitcoin OR "BTC" OR "BTCUSDT")',
+        "ETH/USDT": '("ethereum" OR "ether" OR "ETH" OR "ETHUSDT")',
+        "SOL/USDT": '("solana" OR "SOLUSDT")',
+        "BNB/USDT": '("binance coin" OR "BNB" OR "BNBUSDT")',
+        "XRP/USDT": '("XRP" OR "ripple" OR "XRPUSDT")',
+        "DOGE/USDT": '("dogecoin" OR "DOGE" OR "DOGEUSDT")',
+        "LTC/USDT": '("litecoin" OR "LTC" OR "LTCUSDT")',
+        "LINK/USDT": '("chainlink" OR "LINKUSDT")',
+        "TRX/USDT": '("tron" OR "TRX" OR "TRXUSDT")',
+        "ADA/USDT": '("cardano" OR "ADAUSDT")',
+        "HYPE/USDT": '("hyperliquid" OR "HYPEUSDT")',
+        "XMR/USDT": '("monero" OR "XMR" OR "XMRUSDT")',
+        "ZEC/USDT": '("zcash" OR "ZEC" OR "ZECUSDT")',
+        "USDT.D": '("tether" OR "USDT" OR "stablecoin" OR "stablecoins")',
+    }
+
+    GDELT_GLOBAL_QUERIES = {
+        "GLOBAL_CRYPTO": '("crypto" OR "cryptocurrency" OR "blockchain" OR "bitcoin")',
+    }
+
+
 def init_directories():
     """初始化项目目录结构，应在程序启动时显式调用。"""
     paths_to_create = [
