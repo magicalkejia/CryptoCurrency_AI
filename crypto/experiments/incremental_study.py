@@ -53,6 +53,7 @@ RESEARCH_QUESTION = {
     "Step5_fusion": "多模态融合是否优于单模型?",
     "Step6_meta_gate": "元标签/概率门控是否提升风险收益比?",
     "Step7_tsmom_fusion": "ML信号与TSMOM融合(而非替代)能否跑赢单独TSMOM?",
+    "Step8_onchain_overlay": "链上做总暴露择时叠加(独立sleeve)能否提升中性book?",
 }
 
 
@@ -98,7 +99,8 @@ def _apply_no_trade_band(w: pd.DataFrame, band: float) -> pd.DataFrame:
 
 def _alpha_to_weight_panel(df, alpha, close_panel, fcfg, bars_per_year,
                            smooth_bars=1, deadband=0.0, meta_prob=None, p_threshold=0.55,
-                           deploy_mode="vol_parity", max_vol_scale=3.0, no_trade_band=0.0):
+                           deploy_mode="vol_parity", max_vol_scale=3.0, no_trade_band=0.0,
+                           allow_flat=False):
     """Deploy an OOF alpha as a target-weight panel. Sizing is by CONVICTION
     (per-symbol signed conviction in [-1, 1] that scales with |alpha|, full at
     |alpha| >= edge_cap), with a no-trade deadband, optional meta gate, and EMA
@@ -135,6 +137,14 @@ def _alpha_to_weight_panel(df, alpha, close_panel, fcfg, bars_per_year,
         c_xs = cpanel.sub(cpanel.mean(axis=1), axis=0)                          # remove common factor -> market neutral
         gross = c_xs.abs().sum(axis=1).replace(0.0, np.nan)
         w = c_xs.div(gross, axis=0).fillna(0.0) * gross_cap                     # dollar-neutral, gross=gross_cap
+        if allow_flat:
+            # FLAT CAPABILITY: instead of always investing to full gross_cap, let the
+            # book's gross FLOAT with average conviction strength (mean |conviction| in
+            # [0,1], full at |alpha|>=edge_cap). Weak/clustered signals -> low gross
+            # (partly flat); strong dispersed signals -> full gross. Causal, OOF, and
+            # parameter-free (reuses edge_cap/gross_cap); the book stays dollar-neutral.
+            fullness = cpanel.abs().mean(axis=1).clip(0.0, 1.0)
+            w = w.mul(fullness, axis=0)
         if smooth_bars and smooth_bars > 1:
             w = w.ewm(span=int(smooth_bars), adjust=False).mean()               # damp cross-sectional rank-flip churn (turnover control)
     else:
@@ -165,14 +175,15 @@ def _panel_to_returns(close_panel, w, bars_per_year, fcfg):
 def _alpha_to_returns(df, alpha, close_panel, bars_per_year,
                       meta_prob=None, p_threshold=0.55, fcfg=None,
                       smooth_bars=1, deadband=0.0,
-                      deploy_mode="vol_parity", max_vol_scale=3.0, no_trade_band=0.0):
+                      deploy_mode="vol_parity", max_vol_scale=3.0, no_trade_band=0.0,
+                      allow_flat=False):
     """Conviction-sized deployment of an OOF alpha.
     Returns (returns, ann_turnover, ann_cost_fraction)."""
     w = _alpha_to_weight_panel(df, alpha, close_panel, fcfg, bars_per_year,
                                smooth_bars=smooth_bars, deadband=deadband,
                                meta_prob=meta_prob, p_threshold=p_threshold,
                                deploy_mode=deploy_mode, max_vol_scale=max_vol_scale,
-                               no_trade_band=no_trade_band)
+                               no_trade_band=no_trade_band, allow_flat=allow_flat)
     return _panel_to_returns(close_panel, w, bars_per_year, fcfg)
 
 
@@ -184,6 +195,55 @@ def _tsmom_weight_panel(close_panel, bars_per_year):
 def _tsmom_returns(close_panel, bars_per_year, fcfg=None):
     w = _tsmom_weight_panel(close_panel, bars_per_year)
     return _panel_to_returns(close_panel, w, bars_per_year, fcfg)
+
+
+def per_year_sharpe(returns: pd.Series, bars_per_year: int) -> dict:
+    """Annualized Sharpe of a strategy's return series within each CALENDAR YEAR.
+    A time-stability check: if every year is positive and of similar magnitude,
+    the strategy is regime-robust (and a borderline PBO over near-tied configs is
+    almost certainly a config-ranking artifact rather than genuine overfitting)."""
+    if returns is None or len(returns) < 5:
+        return {}
+    s = returns.copy()
+    s.index = pd.to_datetime(s.index)
+    ann = np.sqrt(bars_per_year)
+    out = {}
+    for yr, grp in s.groupby(s.index.year):
+        sd = grp.std()
+        out[int(yr)] = float(grp.mean() / sd * ann) if (sd > 0 and len(grp) > 5) else float("nan")
+    return out
+
+
+def _confidence_gross_scalar(df, meta_prob, p_threshold):
+    """Per-decision_time fraction of symbols whose calibrated meta-prob clears the
+    threshold. Scales the GROSS of a market-neutral book by average conviction WITHOUT
+    zeroing individual legs (zeroing a leg breaks dollar-neutrality). Shown in the
+    ladder as the 'neutral meta-gate' diagnostic (it degrades the book -> reported as
+    an honest negative result: the meta-gate is a directional concept)."""
+    conf = (np.nan_to_num(meta_prob) > p_threshold).astype(float)
+    tmp = df[["decision_time"]].copy()
+    tmp["conf"] = conf
+    return tmp.groupby("decision_time")["conf"].mean()
+
+
+def _risk_sleeve_combine(close_panel, w_a, w_b, bars_per_year, fcfg, target_vol=0.15):
+    """Combine two strategy sleeves at EQUAL RISK: scale each weight panel so its
+    realized return vol equals `target_vol`, then sum. This is the correct way to
+    add a market-neutral sleeve to a directional one (a 50/50 weight blend would
+    just halve the directional book). `target_vol` is a fixed risk budget (half of
+    the 0.30 portfolio target), not tuned to Sharpe. The per-sleeve vol used for
+    scaling is a risk normalization (no directional lookahead)."""
+    ann = np.sqrt(bars_per_year)
+    ra = _panel_to_returns(close_panel, w_a, bars_per_year, fcfg)[0]
+    rb = _panel_to_returns(close_panel, w_b, bars_per_year, fcfg)[0]
+    sda = float(ra.std() * ann) if len(ra) else 0.0
+    sdb = float(rb.std() * ann) if len(rb) else 0.0
+    sa = (target_vol / sda) if sda > 1e-9 else 0.0
+    sb = (target_vol / sdb) if sdb > 1e-9 else 0.0
+    idx = w_a.index.union(w_b.index)
+    cols = w_a.columns.union(w_b.columns)
+    return (sa * w_a.reindex(index=idx, columns=cols).fillna(0.0)
+            + sb * w_b.reindex(index=idx, columns=cols).fillna(0.0))
 
 
 def _fusion_alpha(df, modality_cols, fcfg, splits):
@@ -243,6 +303,7 @@ def run_incremental_study(
     max_vol_scale: float = 3.0,
     no_trade_band: float = 0.0,
     kind: str = "exploratory",
+    allow_flat: bool = False,
 ) -> pd.DataFrame:
     """
     modality_cols keys expected: market / onchain / narrative / patchtst (any may
@@ -274,64 +335,134 @@ def run_incremental_study(
                                  meta_prob=meta, p_threshold=fcfg.risk.p_threshold, fcfg=fcfg,
                                  smooth_bars=smooth_bars, deadband=deadband,
                                  deploy_mode=deploy_mode, max_vol_scale=max_vol_scale,
-                                 no_trade_band=no_trade_band)
+                                 no_trade_band=no_trade_band, allow_flat=allow_flat)
 
     steps = []  # (name, alpha_or_None, returns, ann_turnover, ann_cost)
+    skip_status = {}
+    xs = (deploy_mode == "xs_neutral")
     r0, t0, c0 = _tsmom_returns(close_panel, bars_per_year, fcfg)
     steps.append(("Step0_baseline_tsmom", None, r0, t0, c0))
 
     cumulative = []
+    side_branch = set()      # steps shown for completeness but OFF the main increment chain
     for name, group in [("Step1_market", mk), ("Step2_+onchain", oc),
                         ("Step3_+narrative", nv), ("Step4_+patchtst", pt_emb)]:
         new_cols = [c for c in group if c in df.columns]
         if not new_cols:                      # modality has no data -> carry previous
             steps.append((name, None, None, np.nan, np.nan))
             continue
+        if xs and name == "Step2_+onchain":
+            # SHOW market+onchain (diagnostic: does on-chain help per-trade?), but DO
+            # NOT carry on-chain into the cumulative -> it stays out of Step4/Step5.
+            # On-chain is a GLOBAL (common-mode) signal: a cross-sectional book demeans
+            # it out, so it adds noise/turnover without relative value. Side-branch.
+            a = _oof_alpha(df, cumulative + new_cols, fcfg, splits)
+            r, tn, cs = deploy(a)
+            steps.append((name, a, r, tn, cs))
+            side_branch.add(name)
+            continue                          # cumulative NOT updated
         cumulative = cumulative + new_cols
         a = _oof_alpha(df, cumulative, fcfg, splits)
         r, tn, cs = deploy(a)
         steps.append((name, a, r, tn, cs))
 
-    # Step5 fusion (mean of per-modality OOF alphas). PatchTST is EXCLUDED from the
-    # fusion: its standalone signal is ~0 (ablation B) so averaging it in only
-    # dilutes the strong market+onchain alpha. Fusion = market + onchain (+ narrative).
-    fused, base_oof = _fusion_alpha(df, {"market": mk, "onchain": oc,
-                                         "narrative": nv}, fcfg, splits)
+    # Step5 fusion (mean of per-modality OOF alphas). PatchTST is EXCLUDED (its
+    # standalone signal is ~0 and dilutes). In xs_neutral, on-chain is ALSO excluded
+    # (common-mode -> overlay), so the cross-sectional fusion = market (+ narrative).
+    fusion_mods = {"market": mk, "narrative": nv}
+    if not xs:
+        fusion_mods["onchain"] = oc
+    fused, base_oof = _fusion_alpha(df, fusion_mods, fcfg, splits)
     r5, t5, c5 = deploy(fused)
     steps.append(("Step5_fusion", fused, r5, t5, c5))
 
-    # Step6 meta gate (adds the meta-probability gate on top of fusion)
-    direction, meta_prob = _meta_gate(df, fused, base_oof, fcfg, splits)
-    r6, t6, c6 = deploy(fused, meta=meta_prob)
-    steps.append(("Step6_meta_gate", fused, r6, t6, c6))
+    # Step6 meta gate. The meta-label scores whether a DIRECTIONAL bet pays off net of
+    # cost -> it is a directional concept. In xs_neutral we SHOW its neutral-aware form
+    # (scale the book GROSS by the fraction of confident names, preserving neutrality)
+    # as an honest NEGATIVE result -- it degrades the book -- and keep it OFF the main
+    # increment chain (side-branch). In vol_parity it is a normal main-chain step.
+    if xs:
+        direction, meta_prob = _meta_gate(df, fused, base_oof, fcfg, splits)
+        w_neu6 = _alpha_to_weight_panel(df, fused, close_panel, fcfg, bars_per_year,
+                                        smooth_bars=smooth_bars, deadband=deadband,
+                                        meta_prob=None, deploy_mode="xs_neutral",
+                                        max_vol_scale=max_vol_scale, no_trade_band=no_trade_band,
+                                        allow_flat=allow_flat)
+        g = _confidence_gross_scalar(df, meta_prob, fcfg.risk.p_threshold)
+        w6 = w_neu6.mul(g.reindex(w_neu6.index).fillna(0.0), axis=0)
+        r6, t6, c6 = _panel_to_returns(close_panel, w6, bars_per_year, fcfg)
+        steps.append(("Step6_meta_gate", fused, r6, t6, c6))
+        side_branch.add("Step6_meta_gate")
+    else:
+        direction, meta_prob = _meta_gate(df, fused, base_oof, fcfg, splits)
+        r6, t6, c6 = deploy(fused, meta=meta_prob)
+        steps.append(("Step6_meta_gate", fused, r6, t6, c6))
 
-    # Step7 TSMOM fusion: COMBINE (not replace) the strong momentum baseline with
-    # the meta-gated ML signal via a fixed 50/50 convex blend of their weight panels.
-    # beta=0.5 is a neutral prior (not tuned to Sharpe).
-    w_ml = _alpha_to_weight_panel(df, fused, close_panel, fcfg, bars_per_year,
-                                  smooth_bars=smooth_bars, deadband=deadband,
-                                  meta_prob=meta_prob, p_threshold=fcfg.risk.p_threshold,
-                                  deploy_mode=deploy_mode, max_vol_scale=max_vol_scale,
-                                  no_trade_band=no_trade_band)
-    w_ts = _tsmom_weight_panel(close_panel, bars_per_year)
-    idx = w_ts.index.union(w_ml.index)
-    cols = w_ts.columns.union(w_ml.columns)
-    beta = 0.5
-    w_blend = (beta * w_ts.reindex(index=idx, columns=cols).fillna(0.0)
-               + (1 - beta) * w_ml.reindex(index=idx, columns=cols).fillna(0.0))
-    r7, t7, c7 = _panel_to_returns(close_panel, w_blend, bars_per_year, fcfg)
+    # Step7: combine the ML sleeve with the TSMOM baseline.
+    if xs:
+        # NEUTRAL sleeve + TSMOM as two EQUAL-RISK vol-targeted sleeves, SUMMED
+        # (not a 50/50 weight blend, which would just halve TSMOM). The neutral
+        # book (no market beta) and TSMOM (pure beta) are ~uncorrelated -> diversify.
+        w_neu7 = _alpha_to_weight_panel(df, fused, close_panel, fcfg, bars_per_year,
+                                        smooth_bars=smooth_bars, deadband=deadband,
+                                        meta_prob=None, deploy_mode="xs_neutral",
+                                        max_vol_scale=max_vol_scale, no_trade_band=no_trade_band,
+                                        allow_flat=allow_flat)
+        w_ts = _tsmom_weight_panel(close_panel, bars_per_year)
+        w7 = _risk_sleeve_combine(close_panel, w_neu7, w_ts, bars_per_year, fcfg)
+        r7, t7, c7 = _panel_to_returns(close_panel, w7, bars_per_year, fcfg)
+    else:
+        # directional: COMBINE (not replace) momentum with meta-gated ML via a fixed
+        # 50/50 convex blend of weight panels. beta=0.5 is a neutral prior.
+        w_ml = _alpha_to_weight_panel(df, fused, close_panel, fcfg, bars_per_year,
+                                      smooth_bars=smooth_bars, deadband=deadband,
+                                      meta_prob=meta_prob, p_threshold=fcfg.risk.p_threshold,
+                                      deploy_mode=deploy_mode, max_vol_scale=max_vol_scale,
+                                      no_trade_band=no_trade_band)
+        w_ts = _tsmom_weight_panel(close_panel, bars_per_year)
+        idx = w_ts.index.union(w_ml.index)
+        cols = w_ts.columns.union(w_ml.columns)
+        beta = 0.5
+        w_blend = (beta * w_ts.reindex(index=idx, columns=cols).fillna(0.0)
+                   + (1 - beta) * w_ml.reindex(index=idx, columns=cols).fillna(0.0))
+        r7, t7, c7 = _panel_to_returns(close_panel, w_blend, bars_per_year, fcfg)
     steps.append(("Step7_tsmom_fusion", fused, r7, t7, c7))
 
-    # assemble metrics + incremental significance vs previous *non-skipped* step
+    # Step8 (xs_neutral only): on-chain GROSS/MARKET-TIMING overlay as a separate
+    # equal-risk sleeve on top of the neutral book. On-chain (global) is deployed
+    # DIRECTIONALLY -> a net market-exposure timer. Shown for completeness / the report
+    # (it does NOT beat the pure neutral book -> honest negative). Side-branch, OOF, no
+    # tuned knobs.
+    if xs:
+        oc_cols = [c for c in oc if c in df.columns]
+        if oc_cols:
+            oc_alpha = _oof_alpha(df, oc_cols, fcfg, splits)
+            w_oc = _alpha_to_weight_panel(df, oc_alpha, close_panel, fcfg, bars_per_year,
+                                          smooth_bars=smooth_bars, deadband=deadband,
+                                          meta_prob=None, deploy_mode="vol_parity",
+                                          max_vol_scale=max_vol_scale, no_trade_band=no_trade_band)
+            w_neu8 = _alpha_to_weight_panel(df, fused, close_panel, fcfg, bars_per_year,
+                                            smooth_bars=smooth_bars, deadband=deadband,
+                                            meta_prob=None, deploy_mode="xs_neutral",
+                                            max_vol_scale=max_vol_scale, no_trade_band=no_trade_band,
+                                            allow_flat=allow_flat)
+            w8 = _risk_sleeve_combine(close_panel, w_neu8, w_oc, bars_per_year, fcfg)
+            r8, t8, c8 = _panel_to_returns(close_panel, w8, bars_per_year, fcfg)
+            steps.append(("Step8_onchain_overlay", oc_alpha, r8, t8, c8))
+            side_branch.add("Step8_onchain_overlay")
+
+    # assemble metrics + incremental significance vs previous MAIN-CHAIN step
     n_steps = sum(1 for _, _, r, _, _ in steps if r is not None)
     rows, prev_ret = [], None
+    returns_by_step = {}
     for name, alpha, ret, tn, cs in steps:
         if ret is None or len(ret) < 5:
             rows.append({"step": name, "research_question": RESEARCH_QUESTION.get(name, ""),
-                         "status": "skipped (no features)", "IC": np.nan, "sharpe_ann": np.nan,
-                         "deflated_sharpe": np.nan, "incr_NW_t": np.nan,
+                         "status": skip_status.get(name, "skipped (no features)"), "IC": np.nan,
+                         "sharpe_ann": np.nan, "deflated_sharpe": np.nan, "incr_NW_t": np.nan,
                          "ann_turnover": np.nan, "ann_cost_pct": np.nan, "included": False})
             continue
+        returns_by_step[name] = ret
         sd = ret.std()
         sharpe = ret.mean() / sd * np.sqrt(bars_per_year) if sd > 0 else np.nan
         dsr = deflated_sharpe_ratio(sharpe / np.sqrt(bars_per_year) if np.isfinite(sharpe) else np.nan,
@@ -354,6 +485,9 @@ def run_incremental_study(
                      "deflated_sharpe": dsr, "incr_NW_t": incr_t,
                      "ann_turnover": tn, "ann_cost_pct": (cs * 100 if np.isfinite(cs) else np.nan),
                      "included": included})
-        prev_ret = ret
+        if name not in side_branch:          # side-branch steps stay OFF the main chain
+            prev_ret = ret
 
-    return pd.DataFrame(rows).set_index("step")
+    out = pd.DataFrame(rows).set_index("step")
+    out.attrs["returns_by_step"] = returns_by_step       # for per-year stability diagnostic
+    return out

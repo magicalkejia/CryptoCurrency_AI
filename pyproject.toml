@@ -36,6 +36,12 @@ dependencies = [
 #   pip install -e ".[dl]"      (CPU torch is fine; GPU later on the school server)
 dl = ["torch>=2.1"]
 
+# Narrative modality: CryptoBERT sentiment scoring of news titles (etl/score_news.py).
+#   pip install -e ".[narrative]"
+# (emoji is a safety net for the BERTweet-style tokenizer; the fast tokenizer used by
+#  score_news.py normally does not need it.)
+narrative = ["torch>=2.1", "transformers>=4.36", "emoji>=2.0"]
+
 [tool.setuptools]
 py-modules = ["config"]
 
