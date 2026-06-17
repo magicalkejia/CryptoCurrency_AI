@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,7 +49,7 @@ from crypto.schemas import FrozenConfig, environment_hash, make_audit_id
 from crypto.adapters import to_bars_schema
 from etl.dataset_builder import build_market_dataset, DEFAULT_FEATURE_SET
 from crypto.pipeline_1b import run_phase1b
-from crypto.experiments.incremental_study import run_incremental_study
+from crypto.experiments.incremental_study import run_incremental_study, per_year_sharpe
 from crypto.experiments.patchtst_ablation import run_ablation, _oof_alpha
 from crypto.cv.purged_kfold import purged_embargoed_splits, default_embargo_delta
 from crypto.governance.pbo import cscv_pbo
@@ -63,6 +64,24 @@ BARS_PER_YEAR_4H = 2190  # 365 * 6
 # --------------------------------------------------------------------------- #
 # synthetic provider — exercises the EXACT real code path without parquet
 # --------------------------------------------------------------------------- #
+class _Tee:
+    """Duplicate stdout to a log file so the full console run is archived alongside the
+    other experiment artifacts (outdir/console_log.txt). Line-buffered + flushed."""
+    def __init__(self, stream, path):
+        self.stream = stream
+        self.fh = open(path, "w", encoding="utf-8")
+
+    def write(self, data):
+        self.stream.write(data)
+        self.fh.write(data)
+        self.fh.flush()
+        return len(data)
+
+    def flush(self):
+        self.stream.flush()
+        self.fh.flush()
+
+
 def _synthetic_bars(seed: int, timeframe: str):
     rng = np.random.default_rng(seed + {"1h": 0, "4h": 1, "1d": 2}[timeframe])
     n, freq = {"1h": (24 * 320, "1h"), "4h": (6 * 320, "4h"), "1d": (320, "1D")}[timeframe]
@@ -81,6 +100,38 @@ def _synthetic_bars(seed: int, timeframe: str):
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+def _xs_regime_by_year(close_panel):
+    """PURE DIAGNOSTIC (no strategy/params touched). Per calendar year, quantify how
+    'together' the universe moves -- a cross-sectional (relative) book needs DISPERSION
+    to work, so a dispersion collapse mechanically weakens it. Three scale-aware /
+    scale-free views, all on dev-period returns:
+      avg_pair_corr : mean off-diagonal pairwise return correlation (higher = worse)
+      xs_dispersion : mean over time of the cross-sectional std of returns, i.e. the
+                      residual spread AROUND the common move that a neutral book trades
+                      (lower = worse)
+      pc1_var_share : share of variance in the 1st principal component / common mode
+                      (higher = common mode dominates = less residual = worse)."""
+    ret = close_panel.pct_change().replace([np.inf, -np.inf], np.nan)
+    ret.index = pd.to_datetime(ret.index)
+    out = {}
+    for yr, grp in ret.groupby(ret.index.year):
+        g = grp.dropna(axis=1, thresh=max(20, int(0.5 * len(grp))))  # symbols present >=half the year
+        g = g.dropna(axis=0, how="any")
+        if g.shape[1] < 2 or len(g) < 20:
+            out[int(yr)] = {"avg_pair_corr": float("nan"), "xs_dispersion": float("nan"),
+                            "pc1_var_share": float("nan"), "n_sym": g.shape[1]}
+            continue
+        C = g.corr().to_numpy()
+        n = C.shape[0]
+        avg_corr = float(np.nanmean(C[~np.eye(n, dtype=bool)]))
+        xs_disp = float(g.std(axis=1).mean())
+        eig = np.linalg.eigvalsh(np.nan_to_num(C, nan=0.0))
+        pc1 = float(eig[-1] / eig.sum()) if eig.sum() > 1e-12 else float("nan")
+        out[int(yr)] = {"avg_pair_corr": avg_corr, "xs_dispersion": xs_disp,
+                        "pc1_var_share": pc1, "n_sym": n}
+    return out
+
+
 def _pbo_over_abcd(ds, tabular_cols, fcfg):
     """PBO (CSCV) over the four ablation configs' OOF sign-strategy returns."""
     forecast = [c for c in ds.columns if c.startswith("patchtst_forecast_")]
@@ -99,6 +150,42 @@ def _pbo_over_abcd(ds, tabular_cols, fcfg):
         a = _oof_alpha(ds, c, fcfg, splits)
         streams.append(np.where(np.isfinite(a), np.sign(np.nan_to_num(a)) * fwd, 0.0))
     return cscv_pbo(np.column_stack(streams), n_blocks=8)
+
+
+def _pbo_over_grid(ds, tabular_cols, fcfg, n_blocks=12):
+    """CSCV PBO over a WIDER grid of model-hyperparameter configs (the textbook CSCV
+    setup). More reliable than the 4-config ablation PBO, which is noisy when A/C/D are
+    near-tied (all DSR~1.0 -> 'which is best' is a coin-flip -> PBO drifts to ~0.5).
+    Each grid point is a perturbation of the frozen LightGBM config; we build its OOF
+    sign-strategy return stream on the MARKET feature set and run CSCV over all streams.
+    This does NOT change the deployed strategy -- it only stress-tests how much
+    'selecting the best config' would overfit. OOF + purged/embargoed throughout."""
+    if not tabular_cols:
+        return {"pbo": float("nan"), "n_combinations": 0, "n_configs": 0}
+    grid = [(d, n, lr)
+            for d in (3, 4, 5)            # capacity (depth)
+            for n in (150, 300)           # capacity (trees)
+            for lr in (0.03, 0.08)]       # learning rate  -> 3*2*2 = 12 configs
+    splits = purged_embargoed_splits(ds["decision_time"], ds["entry_time"], ds["exit_time"],
+                                     fcfg.cv.n_splits, default_embargo_delta(fcfg.cv),
+                                     symbol=ds["symbol"])
+    fwd = ds["raw_exit_return_long"].to_numpy(float)
+    streams = []
+    for (d, n, lr) in grid:
+        fc = replace(fcfg, model=replace(fcfg.model, max_depth=d, n_estimators=n,
+                                         learning_rate=lr))
+        a = _oof_alpha(ds, tabular_cols, fc, splits)
+        streams.append(np.where(np.isfinite(a), np.sign(np.nan_to_num(a)) * fwd, 0.0))
+    res = cscv_pbo(np.column_stack(streams), n_blocks=n_blocks)
+    res["n_configs"] = len(grid)
+    # per-config mean per-trade edge (bps) -> spread tells near-tie from genuine spread:
+    # if all 12 configs have ~identical edge, the signal is hyperparam-robust and a high
+    # PBO is a near-tie artifact (NOT overfitting); a wide spread + high PBO would instead
+    # mean the IS-best config genuinely overfits (which would justify freezing by principle).
+    edges = [float(np.mean(s)) * 1e4 for s in streams]
+    res["edge_bps_min"], res["edge_bps_max"] = min(edges), max(edges)
+    res["edge_bps_spread"] = max(edges) - min(edges)
+    return res
 
 
 def _latest_signals(ds, signals, fcfg, code_hash="experiment"):
@@ -336,6 +423,21 @@ def main():
     ap.add_argument("--no_trade_band", type=float, default=0.0,
                     help="final-weight hysteresis band (e.g. 0.05): only rebalance a symbol when its "
                          "target weight moves more than this (turnover control)")
+    ap.add_argument("--no_pbo_grid", action="store_true",
+                    help="skip the wider-grid PBO in [5d] (faster; the 4-config ablation PBO in [5] "
+                         "is still computed)")
+    ap.add_argument("--xs_allow_flat", action="store_true",
+                    help="xs_neutral: let the book GROSS float with average conviction strength "
+                         "(stay partly flat when signals are weak) instead of always investing to "
+                         "full gross_cap. Still dollar-neutral. OOF/causal, no tuned knob.")
+    ap.add_argument("--narrative_parquet", default=None,
+                    help="path to narrative_features.parquet (per-symbol CryptoBERT sentiment). "
+                         "If given, the narrative modality is asof-merged in (PIT-safe) and Step3 / "
+                         "Step5 fusion will use it. Build it with etl.score_news + "
+                         "etl.build_narrative_features.")
+    ap.add_argument("--narrative_buffer_min", type=int, default=0,
+                    help="extra PIT safety buffer in minutes for the narrative asof-merge "
+                         "(default 0; the 4h binning already guarantees strictly-before-decision news)")
     ap.add_argument("--p_threshold", type=float, default=None,
                     help="override meta-gate probability threshold (default 0.55 from RiskConfig); "
                          "changes config_hash")
@@ -371,6 +473,7 @@ def main():
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     outdir = Path(args.outdir) if args.outdir else Path(config.PathConfig.EXPERIMENTS) / stamp
     outdir.mkdir(parents=True, exist_ok=True)
+    sys.stdout = _Tee(sys.__stdout__, outdir / "console_log.txt")  # archive full console run
 
     print("=" * 74)
     print(f" v6 MARKET EXPERIMENT  (LightGBM + PatchTST)   {stamp}")
@@ -413,6 +516,19 @@ def main():
         print(f"    onchain coverage: {oc.get('rows_with_onchain', 0)} rows "
               f"(real DefiLlama data from {oc.get('onchain_start', 'n/a')})")
 
+    # --- narrative modality (PREVIEW hook): asof-merge per-symbol CryptoBERT sentiment ---
+    if args.narrative_parquet:
+        from etl.narrative_loader import load_narrative_features, attach_narrative
+        from etl.build_narrative_features import FEATURE_COLS as _NARR
+        narr = load_narrative_features(args.narrative_parquet)
+        attach_narrative(md.dataset, md.modality_cols, narr, buffer_min=args.narrative_buffer_min)
+        cov = (md.dataset.assign(_h=(md.dataset[_NARR].abs().sum(axis=1) > 0))
+               .groupby("symbol")["_h"].mean())
+        print(f"    narrative columns: {md.modality_cols['narrative']}  "
+              f"(PIT asof, buffer={args.narrative_buffer_min}min)")
+        print("    narrative coverage (fraction of decisions with any news, by symbol): "
+              + ", ".join(f"{s.split('/')[0]}={v:.2f}" for s, v in cov.items()))
+
     print("\n[2] PIT LEAKAGE AUDIT")
     print(f"    future_function_checks_passed = {md.audit['future_function_checks_passed']}  "
           f"(violations={md.audit['availability_lag_violations']}, rows={md.audit['n_rows']})")
@@ -436,7 +552,7 @@ def main():
     ladder = run_incremental_study(dev, dev_close, md.modality_cols, fcfg, bars_per_year=BARS_PER_YEAR_4H,
                                    smooth_bars=args.smooth_bars, deadband=args.deadband,
                                    deploy_mode=args.deploy_mode, max_vol_scale=args.max_vol_scale,
-                                   no_trade_band=args.no_trade_band)
+                                   no_trade_band=args.no_trade_band, allow_flat=args.xs_allow_flat)
     pd.set_option("display.width", 180, "display.max_columns", 20)
     print(ladder.round(4).to_string())
     ladder.to_csv(outdir / "incremental_ladder.csv")
@@ -454,6 +570,53 @@ def main():
     pbo = _pbo_over_abcd(dev, md.tabular_cols, fcfg)
     print(f"    PBO = {_fmt(pbo['pbo'], '{:.3f}')}  over {pbo['n_combinations']} combinations "
           f"(lower is better; <0.5 = IS-best tends to stay good OOS)")
+
+    # ---- 5b. per-year Sharpe stability (time-robustness; clarifies a borderline PBO) ----
+    print("\n[5b] PER-YEAR SHARPE STABILITY  [dev only]  (consistent positive years = "
+          "regime-robust; a borderline PBO over near-tied A/B/C/D is then a ranking artifact)")
+    rbs = ladder.attrs.get("returns_by_step", {})
+    key_steps = [s for s in ("Step0_baseline_tsmom", "Step1_market", "Step5_fusion",
+                             "Step7_tsmom_fusion", "Step8_onchain_overlay") if s in rbs]
+    if not key_steps:
+        print("    (no deployable step returns available)")
+    else:
+        years = sorted({y for s in key_steps for y in per_year_sharpe(rbs[s], BARS_PER_YEAR_4H)})
+        print("    " + "step".ljust(22) + "".join(f"{y:>8}" for y in years) + "    full")
+        for s in key_steps:
+            py = per_year_sharpe(rbs[s], BARS_PER_YEAR_4H)
+            full = ladder.loc[s, "sharpe_ann"] if s in ladder.index else float("nan")
+            cells = "".join(f"{py.get(y, float('nan')):>8.2f}" for y in years)
+            print("    " + s.ljust(22) + cells + f"    {full:>5.2f}")
+
+    # ---- 5c. cross-sectional regime diagnostic (pure; explains 2025 weakness) ----
+    print("\n[5c] CROSS-SECTIONAL REGIME DIAGNOSTIC  [dev only]  (pure diagnostic, no "
+          "strategy/param change)\n     a relative book needs DISPERSION: if a weak year "
+          "shows higher corr / lower dispersion / higher PC1, that explains it")
+    reg = _xs_regime_by_year(dev_close)
+    s1 = per_year_sharpe(rbs["Step1_market"], BARS_PER_YEAR_4H) if "Step1_market" in rbs else {}
+    print("    " + "year".ljust(8) + "avg_pair_corr".rjust(15) + "xs_dispersion".rjust(15)
+          + "pc1_var_share".rjust(15) + "Step1_Sharpe".rjust(14))
+    for y in sorted(reg):
+        r = reg[y]
+        print("    " + str(y).ljust(8)
+              + f"{r['avg_pair_corr']:>15.3f}{r['xs_dispersion']:>15.4f}"
+              + f"{r['pc1_var_share']:>15.3f}{s1.get(y, float('nan')):>14.2f}")
+
+    # ---- 5d. wider-grid PBO (more reliable than the 4-config ablation PBO) ----
+    if not args.no_pbo_grid:
+        print("\n[5d] PBO over WIDER MODEL GRID  [dev only]  (more reliable than [5]'s "
+              "4-config ablation PBO, which is noisy when A/C/D are near-tied)")
+        pbo_grid = _pbo_over_grid(dev, md.tabular_cols, fcfg)
+        print(f"    PBO = {_fmt(pbo_grid['pbo'], '{:.3f}')}  over {pbo_grid['n_combinations']} "
+              f"combinations from {pbo_grid.get('n_configs', 0)} model configs "
+              f"(depth x trees x lr; lower is better, <0.5 good)")
+        print(f"    per-config per-trade edge: min={pbo_grid.get('edge_bps_min', float('nan')):.3f} "
+              f"max={pbo_grid.get('edge_bps_max', float('nan')):.3f} "
+              f"spread={pbo_grid.get('edge_bps_spread', float('nan')):.3f} bps  "
+              f"(TIGHT spread => configs near-identical => high PBO is a near-tie artifact, "
+              f"not overfitting)")
+    else:
+        pbo_grid = {"pbo": float("nan"), "n_configs": 0}
 
     # ---- 5. phase-1b signals + ECE (DEV ONLY) ----
     print("\n[6] PHASE-1B SIGNALS (two-stage meta-labelling + calibration)  [dev only]")
@@ -489,6 +652,7 @@ def main():
     print(f"\nDONE. Full report + CSV/JSON in: {outdir}")
     print("Read EXPERIMENT_report.md first; signals_oof.csv = full OOF signals; "
           "signals_latest.json = §1.4 structured output.")
+    print(f"Full console log archived -> {outdir / 'console_log.txt'}")
 
 
 if __name__ == "__main__":

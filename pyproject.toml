@@ -35,6 +35,12 @@ dependencies = [
 #   pip install -e ".[dl]"      (CPU torch is fine; GPU later on the school server)
 dl = ["torch>=2.1"]
 
+# Narrative modality: CryptoBERT sentiment scoring of news titles (etl/score_news.py).
+#   pip install -e ".[narrative]"
+# (emoji is a safety net for the BERTweet-style tokenizer; the fast tokenizer used by
+#  score_news.py normally does not need it.)
+narrative = ["torch>=2.1", "transformers>=4.36", "emoji>=2.0"]
+
 [tool.setuptools]
 py-modules = ["config"]
 
@@ -48,7 +54,7 @@ sysrun = "pip install -e ."
 marketonly_dataupdate = "python main.py --mode crypto"
 dataupdate =  "python main.py --mode crypto --fetch-derivatives"
 onchain_dataupdate = "python main.py --mode crypto --skip-market --fetch-onchain --process-onchain --build-onchain-factors"
-feature = "python main.py --mode crypto --skip-market --build-features --feature-builder multimodal"
+features_h = "python main.py --mode crypto --skip-market --build-features --feature-builder multimodal"
 realdata = "python run_on_real_data.py"
 experiment = "python run_on_real_data.py --symbols BTC/USDT ETH/USDT SOL/USDT BNB/USDT"
 selftest = "python run_on_real_data.py --synthetic"
