@@ -916,6 +916,8 @@ def fetch_coindesk_article_details(
     input_path: str | Path | None = None,
     output_path: str | Path | None = None,
     body_output_path: str | Path | None = None,
+    start_date=None,
+    end_date=None,
     limit: int | None = 300,
     append: bool = True,
     save_article_body: bool = True,
@@ -962,7 +964,15 @@ def fetch_coindesk_article_details(
     rows_df = archive_index.copy()
     rows_df = rows_df.dropna(subset=["url"]).drop_duplicates(subset=["url"], keep="last")
     rows_df["published_date"] = pd.to_datetime(rows_df.get("published_date"), errors="coerce")
+    if start_date is not None:
+        rows_df = rows_df[rows_df["published_date"] >= pd.to_datetime(start_date)]
+    if end_date is not None:
+        rows_df = rows_df[rows_df["published_date"] <= pd.to_datetime(end_date)]
     rows_df = rows_df.sort_values(["published_date", "url"], na_position="last")
+    print(
+        "CoinDesk article detail date filter: "
+        f"start={start_date or 'min'}, end={end_date or 'max'}, candidate_rows={len(rows_df)}"
+    )
 
     out_path = Path(output_path) if output_path else (
         config.PathConfig.RAW_SENTIMENT / config.SentimentConfig.COINDESK_ARTICLE_DETAIL_OUTPUT_NAME

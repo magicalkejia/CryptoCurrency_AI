@@ -22,8 +22,10 @@ from etl.sentiment_updater import (
 )
 
 
-START_YEAR = 2021
+START_YEAR = 2024
 END_YEAR = pd.Timestamp.utcnow().year
+ARTICLE_START_DATE = f"{START_YEAR}-01-01"
+ARTICLE_END_DATE = None
 
 # Keep this script friendly to run from taskipy / IDE. Edit these constants
 # instead of passing a long command line.
@@ -62,12 +64,12 @@ BROWSER_CHANNEL = "chrome"
 
 # Be polite and reduce account / site risk. If CoinDesk starts redirecting or
 # showing rate-limit behavior, keep this conservative.
-SLEEP_SECONDS = 1.5
+SLEEP_SECONDS = 2.5
 
 # Performance knobs. CoinDesk pages often keep analytics/ad requests alive, so
 # waiting for networkidle can cost a fixed 8s per article. Metadata/body are
 # usually available after domcontentloaded plus a short settle wait.
-PAGE_SETTLE_SECONDS = 1.0
+PAGE_SETTLE_SECONDS = 5.0
 WAIT_FOR_NETWORK_IDLE = False
 NETWORK_IDLE_TIMEOUT_MS = 1500
 BLOCK_HEAVY_RESOURCES = True
@@ -103,6 +105,8 @@ def main() -> None:
     if FETCH_ARTICLE_DETAILS:
         fetch_coindesk_article_details(
             archive_index=archive,
+            start_date=ARTICLE_START_DATE,
+            end_date=ARTICLE_END_DATE,
             limit=ARTICLE_DETAIL_LIMIT,
             append=True,
             use_existing_browser_cdp=USE_EXISTING_CHROME_CDP,
