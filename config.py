@@ -123,38 +123,23 @@ class OnchainConfig:
 class SentimentConfig:
     """News/social sentiment source configuration."""
 
-    GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
-    GDELT_OUTPUT_NAME = "gdelt_articles.parquet"
-    GDELT_MAX_RECORDS = 250
-    GDELT_WINDOW_HOURS = 24
-    GDELT_SLEEP_SECONDS = 2.0
-    GDELT_RETRIES = 3
-    GDELT_BACKOFF_SECONDS = 10.0
-    GDELT_USE_PROXY = os.getenv("GDELT_USE_PROXY", "true").lower() == "true"
-    GDELT_DEFAULT_LOOKBACK_DAYS = 7
+    RSS_OUTPUT_NAME = "rss_articles.parquet"
+    RSS_USE_PROXY = os.getenv("RSS_USE_PROXY", os.getenv("ENABLE_PROXY", "false")).lower() == "true"
+    RSS_PROXY_URL = os.getenv("RSS_PROXY_URL", os.getenv("PROXY_URL", "http://127.0.0.1:7897"))
+    RSS_RETRIES = 2
+    RSS_BACKOFF_SECONDS = 5.0
 
-    # GDELT is keyword-based news search, so avoid ambiguous tickers where
-    # possible and include project names.
-    GDELT_SYMBOL_QUERIES = {
-        "BTC/USDT": '(bitcoin OR "BTC" OR "BTCUSDT")',
-        "ETH/USDT": '("ethereum" OR "ether" OR "ETH" OR "ETHUSDT")',
-        "SOL/USDT": '("solana" OR "SOLUSDT")',
-        "BNB/USDT": '("binance coin" OR "BNB" OR "BNBUSDT")',
-        "XRP/USDT": '("XRP" OR "ripple" OR "XRPUSDT")',
-        "DOGE/USDT": '("dogecoin" OR "DOGE" OR "DOGEUSDT")',
-        "LTC/USDT": '("litecoin" OR "LTC" OR "LTCUSDT")',
-        "LINK/USDT": '("chainlink" OR "LINKUSDT")',
-        "TRX/USDT": '("tron" OR "TRX" OR "TRXUSDT")',
-        "ADA/USDT": '("cardano" OR "ADAUSDT")',
-        "HYPE/USDT": '("hyperliquid" OR "HYPEUSDT")',
-        "XMR/USDT": '("monero" OR "XMR" OR "XMRUSDT")',
-        "ZEC/USDT": '("zcash" OR "ZEC" OR "ZECUSDT")',
-        "USDT.D": '("tether" OR "USDT" OR "stablecoin" OR "stablecoins")',
+    RSS_FEEDS = {
+        "coindesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "cointelegraph": "https://cointelegraph.com/rss",
+        "decrypt": "https://decrypt.co/feed",
+        "cryptoslate": "https://cryptoslate.com/feed/",
     }
 
-    GDELT_GLOBAL_QUERIES = {
-        "GLOBAL_CRYPTO": '("crypto" OR "cryptocurrency" OR "blockchain" OR "bitcoin")',
-    }
+    COINDESK_ARCHIVE_BASE_URL = "https://www.coindesk.com/sitemap/archive"
+    COINDESK_ARCHIVE_OUTPUT_NAME = "coindesk_archive_index.parquet"
+    COINDESK_ARTICLE_DETAIL_OUTPUT_NAME = "coindesk_article_details.parquet"
+    COINDESK_ARTICLE_BODY_OUTPUT_NAME = "coindesk_article_bodies.parquet"
 
 
 def init_directories():

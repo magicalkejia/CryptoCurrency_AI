@@ -159,3 +159,4 @@ task onchain_dataupdate
 ```
 task feature
 ```
+task coindesk_archive

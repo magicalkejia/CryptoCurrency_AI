@@ -48,10 +48,6 @@ class CryptoPipelineConfig:
 
     # 舆情 / 新闻数据
     fetch_sentiment: bool = False
-    sentiment_start: str | None = None
-    sentiment_end: str | None = None
-    sentiment_symbols: Sequence[str] | None = None
-    include_global_sentiment: bool = True
 
     build_model_features: bool = False
     feature_builder: FeatureBuilderName = "none"
@@ -74,10 +70,6 @@ def run_crypto_pipeline(
     onchain_chains: Sequence[str] | None = None,
     include_onchain_snapshots: bool = False,
     fetch_sentiment: bool = False,
-    sentiment_start: str | None = None,
-    sentiment_end: str | None = None,
-    sentiment_symbols: Sequence[str] | None = None,
-    include_global_sentiment: bool = True,
 ) -> dict:
     """
     Run the crypto data pipeline.
@@ -107,10 +99,6 @@ def run_crypto_pipeline(
             onchain_chains=list(onchain_chains or config.OnchainConfig.DEFILLAMA_CHAINS),
             include_onchain_snapshots=include_onchain_snapshots,
             fetch_sentiment=fetch_sentiment,
-            sentiment_start=sentiment_start,
-            sentiment_end=sentiment_end,
-            sentiment_symbols=list(sentiment_symbols) if sentiment_symbols is not None else None,
-            include_global_sentiment=include_global_sentiment,
             build_model_features=build_model_features,
             feature_builder=feature_builder,
         )
@@ -231,19 +219,13 @@ def _build_onchain_factors() -> dict:
 
 
 def _fetch_sentiment(cfg: CryptoPipelineConfig) -> dict:
-    from etl.sentiment_updater import fetch_gdelt_crypto_news
+    from etl.sentiment_updater import fetch_rss_crypto_news
 
-    articles = fetch_gdelt_crypto_news(
-        symbols=cfg.sentiment_symbols or list(config.SentimentConfig.GDELT_SYMBOL_QUERIES),
-        include_global=cfg.include_global_sentiment,
-        start_date=cfg.sentiment_start,
-        end_date=cfg.sentiment_end,
-        append=True,
-    )
+    articles = fetch_rss_crypto_news(append=True)
     return {
-        "source": "gdelt_doc2",
+        "source": "rss",
         "rows": len(articles),
-        "output_path": str(config.PathConfig.RAW_SENTIMENT / config.SentimentConfig.GDELT_OUTPUT_NAME),
+        "output_path": str(config.PathConfig.RAW_SENTIMENT / config.SentimentConfig.RSS_OUTPUT_NAME),
     }
 
 
