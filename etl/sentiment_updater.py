@@ -24,6 +24,7 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -90,8 +91,52 @@ COINDESK_ARTICLE_BODY_COLUMNS = [
 ]
 
 
+CRYPTOSLATE_ARCHIVE_COLUMNS = [
+    "url",
+    "title",
+    "published_date",
+    "source",
+    "section",
+    "description",
+    "archive_page",
+    "archive_page_url",
+    "fetched_at",
+]
+
+
+CRYPTOSLATE_ARTICLE_COLUMNS = [
+    "url",
+    "title",
+    "published_date",
+    "published_at",
+    "section",
+    "author",
+    "description",
+    "asset_tags",
+    "sentiment_label",
+    "source",
+    "fetch_status",
+    "fetched_at",
+]
+
+
+CRYPTOSLATE_ARTICLE_BODY_COLUMNS = [
+    "url",
+    "body_text",
+    "body_char_count",
+    "body_word_count",
+    "body_hash",
+    "source",
+    "fetch_status",
+    "fetched_at",
+]
+
+
+HTML_ACCEPT_HEADER = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 COINDESK_MAX_ARCHIVE_PAGES_PER_YEAR = 100
 COINDESK_TERMINAL_DETAIL_STATUSES = {"ok", "http_404"}
+CRYPTOSLATE_TERMINAL_DETAIL_STATUSES = {"ok", "http_404", "out_of_range"}
+CRYPTOSLATE_PROGRESS_HIDDEN_STATUSES = {"http_404", "out_of_range"}
 
 
 def _proxy_opener(use_proxy: bool):
@@ -114,12 +159,13 @@ def _fetch_bytes(
     backoff_seconds: float,
     use_proxy: bool,
     timeout_seconds: int = 30,
+    accept: str = "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
 ) -> bytes:
     req = urllib.request.Request(
         url,
         headers={
             "User-Agent": "TradingSystem/0.1 sentiment updater",
-            "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+            "Accept": accept,
         },
     )
     last_error: Exception | None = None
@@ -1435,6 +1481,15 @@ async def _polite_sleep_async(seconds: float) -> None:
         await asyncio.sleep(delay)
 
 
+def _format_duration(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "--:--:--"
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def _load_browser_page_bytes(
     page,
     url: str,
@@ -1784,6 +1839,14 @@ def _delete_parquet_parts(parts_dir: Path) -> None:
         part.unlink()
 
 
+def _delete_parquet_files(paths: list[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _write_parquet_atomic(path: Path, df: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -1833,6 +1896,1077 @@ def _dedupe_coindesk_archive(df: pd.DataFrame) -> pd.DataFrame:
     out = out.drop_duplicates(subset=["url"], keep="last")
     return out[COINDESK_ARCHIVE_COLUMNS].sort_values(
         ["archive_year", "archive_page", "published_date", "url"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def _cryptoslate_news_url(page: int | None = None) -> str:
+    base = config.SentimentConfig.CRYPTOSLATE_NEWS_BASE_URL.rstrip("/")
+    if page is None or int(page) <= 1:
+        return f"{base}/"
+    return f"{base}/page/{int(page)}/"
+
+
+def _cryptoslate_page_count(payload: bytes) -> int:
+    html_text = payload.decode("utf-8", errors="replace")
+    counts = [1]
+    text = _strip_html(html_text)
+    page_text_match = re.search(r"\bPage\s+\d+\s+of\s+(\d+)\b", text, flags=re.IGNORECASE)
+    if page_text_match:
+        counts.append(int(page_text_match.group(1)))
+    for match in re.finditer(r"/news/page/(\d+)/?", html_text, flags=re.IGNORECASE):
+        counts.append(int(match.group(1)))
+    return max(counts)
+
+
+def _absolute_url(url: str, *, base_url: str) -> str:
+    return urllib.parse.urljoin(base_url, html.unescape(url).strip())
+
+
+def _is_cryptoslate_article_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    host = parsed.netloc.lower()
+    if host and not host.endswith("cryptoslate.com"):
+        return False
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) != 1:
+        return False
+    slug = parts[0].lower()
+    if not slug or "." in slug or "-" not in slug:
+        return False
+    excluded = {
+        "about",
+        "advertise",
+        "companies",
+        "contact",
+        "cryptoslate-alpha",
+        "events",
+        "glossary",
+        "markets",
+        "news",
+        "newsletter",
+        "podcasts",
+        "press-releases",
+        "price",
+        "research",
+        "sitemap",
+    }
+    return slug not in excluded
+
+
+def _first_link_text(block: str, *, base_url: str) -> tuple[str | None, str | None]:
+    link_pattern = re.compile(
+        r"<a\b(?P<attrs>[^>]*)>(?P<body>.*?)</a>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    href_pattern = re.compile(r"""href\s*=\s*['\"](?P<href>[^'\"]+)['\"]""", flags=re.IGNORECASE)
+    for match in link_pattern.finditer(block):
+        href_match = href_pattern.search(match.group("attrs"))
+        if not href_match:
+            continue
+        url = _absolute_url(href_match.group("href"), base_url=base_url)
+        if not _is_cryptoslate_article_url(url):
+            continue
+        text = _clean_text(match.group("body"))
+        return url, text
+    return None, None
+
+
+def _first_heading_text(block: str) -> str | None:
+    for tag in ("h1", "h2", "h3", "h4"):
+        blocks = _extract_tag_blocks(block, tag)
+        for heading in blocks:
+            text = _clean_text(heading)
+            if text:
+                return text
+    return None
+
+
+def _first_paragraph_text(block: str) -> str | None:
+    for paragraph in _extract_tag_blocks(block, "p"):
+        text = _clean_text(paragraph)
+        if text and len(text) >= 25:
+            return text
+    return None
+
+
+def _html_title_text(html_text: str) -> str | None:
+    blocks = _extract_tag_blocks(html_text, "title")
+    if not blocks:
+        return None
+    return _clean_text(blocks[0])
+
+
+def _first_datetime_from_html(block: str) -> pd.Timestamp:
+    attr_patterns = [
+        r"""<time\b[^>]*datetime\s*=\s*['\"](?P<value>[^'\"]+)['\"]""",
+        r"""datePublished['\"]?\s*[:=]\s*['\"](?P<value>[^'\"]+)['\"]""",
+        r"""published_time['\"]?\s*[:=]\s*['\"](?P<value>[^'\"]+)['\"]""",
+    ]
+    for pattern in attr_patterns:
+        match = re.search(pattern, block, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            ts = _parse_timestamp(match.group("value"))
+            if not pd.isna(ts):
+                return ts
+
+    visible = _strip_html(block)
+    month_pattern = (
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
+        r"\.?\s+\d{1,2},\s+20\d{2}"
+        r"(?:\s+at\s+\d{1,2}:\d{2}\s*(?:am|pm)?\s*(?:GMT|UTC)?)?"
+    )
+    match = re.search(month_pattern, visible, flags=re.IGNORECASE)
+    if match:
+        value = match.group(0).replace("Sept.", "Sep").replace(".", "")
+        value = re.sub(r"\s+at\s+", " ", value, flags=re.IGNORECASE)
+        ts = _parse_timestamp(value)
+        if not pd.isna(ts):
+            return ts
+    return pd.NaT
+
+
+def _published_date_from_timestamp(ts: pd.Timestamp) -> pd.Timestamp:
+    if pd.isna(ts):
+        return pd.NaT
+    return pd.to_datetime(ts, errors="coerce").normalize()
+
+
+def _parse_cryptoslate_archive_html(
+    payload: bytes,
+    *,
+    archive_page: int,
+    page_url: str,
+    fetched_at: pd.Timestamp,
+) -> pd.DataFrame:
+    html_text = payload.decode("utf-8", errors="replace")
+    rows_by_url: dict[str, dict] = {}
+
+    blocks = _extract_tag_blocks(html_text, "article")
+    if not blocks:
+        blocks = re.findall(
+            r"<div\b[^>]*>(?P<body>.*?</a>.*?</div>)",
+            html_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+    for block in blocks:
+        url, link_text = _first_link_text(block, base_url=page_url)
+        if not url:
+            continue
+        published_at = _first_datetime_from_html(block)
+        row = {
+            "url": url,
+            "title": _first_heading_text(block) or link_text,
+            "published_date": _published_date_from_timestamp(published_at),
+            "source": "cryptoslate",
+            "section": _cryptoslate_section_from_text(block),
+            "description": _first_paragraph_text(block),
+            "archive_page": archive_page,
+            "archive_page_url": page_url,
+            "fetched_at": fetched_at,
+        }
+        rows_by_url[url] = row
+
+    if not rows_by_url:
+        link_pattern = re.compile(
+            r"<a\b(?P<attrs>[^>]*)>(?P<body>.*?)</a>",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        href_pattern = re.compile(r"""href\s*=\s*['\"](?P<href>[^'\"]+)['\"]""", flags=re.IGNORECASE)
+        for match in link_pattern.finditer(html_text):
+            href_match = href_pattern.search(match.group("attrs"))
+            if not href_match:
+                continue
+            url = _absolute_url(href_match.group("href"), base_url=page_url)
+            if not _is_cryptoslate_article_url(url) or url in rows_by_url:
+                continue
+            rows_by_url[url] = {
+                "url": url,
+                "title": _clean_text(match.group("body")),
+                "published_date": pd.NaT,
+                "source": "cryptoslate",
+                "section": None,
+                "description": None,
+                "archive_page": archive_page,
+                "archive_page_url": page_url,
+                "fetched_at": fetched_at,
+            }
+
+    if not rows_by_url:
+        return pd.DataFrame(columns=CRYPTOSLATE_ARCHIVE_COLUMNS)
+    return _dedupe_cryptoslate_archive(pd.DataFrame(rows_by_url.values(), columns=CRYPTOSLATE_ARCHIVE_COLUMNS))
+
+
+def _cryptoslate_section_from_text(value: str) -> str | None:
+    text = _strip_html(value)
+    known = [
+        "Bitcoin",
+        "Ethereum",
+        "DeFi",
+        "Regulation",
+        "Markets",
+        "Macro",
+        "Trading",
+        "ETF",
+        "Mining",
+        "Stablecoins",
+        "NFT",
+        "AI",
+        "Security",
+        "Policy",
+    ]
+    for item in known:
+        if re.search(rf"\b{re.escape(item)}\b", text, flags=re.IGNORECASE):
+            return item
+    return None
+
+
+def fetch_cryptoslate_archive_index(
+    *,
+    start_date: str | pd.Timestamp | None = None,
+    end_date: str | pd.Timestamp | None = None,
+    max_pages: int | None = None,
+    append: bool = True,
+    output_path: str | Path | None = None,
+    stop_after_older_pages: int = 3,
+    stop_after_empty_pages: int = 3,
+    sleep_seconds: float = 0.5,
+    cfg: RSSConfig | None = None,
+) -> pd.DataFrame:
+    """Fetch CryptoSlate public news listing pages and save URL-level index rows."""
+    cfg = cfg or RSSConfig()
+    start_ts = _parse_timestamp(start_date) if start_date is not None else pd.NaT
+    end_ts = _parse_timestamp(end_date) if end_date is not None else pd.NaT
+    path = Path(output_path) if output_path else (
+        config.PathConfig.RAW_SENTIMENT / config.SentimentConfig.CRYPTOSLATE_ARCHIVE_OUTPUT_NAME
+    )
+    existing = pd.read_parquet(path) if append and path.exists() else pd.DataFrame(columns=CRYPTOSLATE_ARCHIVE_COLUMNS)
+    existing = _dedupe_cryptoslate_archive(existing)
+    completed_pages = _completed_cryptoslate_archive_pages(existing)
+
+    first_url = _cryptoslate_news_url(1)
+    fetched_at = pd.Timestamp.utcnow().tz_localize(None)
+    first_payload = _fetch_bytes(
+        first_url,
+        retries=cfg.retries,
+        backoff_seconds=cfg.backoff_seconds,
+        use_proxy=cfg.use_proxy,
+        accept=HTML_ACCEPT_HEADER,
+    )
+    page_count = _cryptoslate_page_count(first_payload)
+    page_limit = int(max_pages) if max_pages else page_count
+    print(
+        "CryptoSlate index page plan: "
+        f"detected_pages={page_count}, configured_limit={max_pages or '-'}, crawl_limit={page_limit}"
+    )
+
+    frames: list[pd.DataFrame] = []
+    older_pages = 0
+    empty_pages = 0
+
+    for page in range(1, page_limit + 1):
+        page_url = _cryptoslate_news_url(page)
+        if page in completed_pages:
+            print(f"Skipping CryptoSlate index page already saved: {page}/{page_limit}")
+            continue
+
+        print(f"Fetching CryptoSlate index page: {page}/{page_limit} | {page_url}")
+        try:
+            payload = first_payload if page == 1 else _fetch_bytes(
+                page_url,
+                retries=cfg.retries,
+                backoff_seconds=cfg.backoff_seconds,
+                use_proxy=cfg.use_proxy,
+                accept=HTML_ACCEPT_HEADER,
+            )
+            page_frame = _parse_cryptoslate_archive_html(
+                payload,
+                archive_page=page,
+                page_url=page_url,
+                fetched_at=fetched_at,
+            )
+        except Exception as exc:
+            print(f"[WARN] CryptoSlate index page skipped: {page_url} | {exc}")
+            _polite_sleep(sleep_seconds)
+            continue
+
+        if not page_frame.empty:
+            frames.append(page_frame)
+            _write_cryptoslate_archive_index(path, existing, frames)
+            empty_pages = 0
+        else:
+            empty_pages += 1
+            print(f"[WARN] CryptoSlate index page had no article URLs: {page_url}")
+            if empty_pages >= max(1, int(stop_after_empty_pages)):
+                print(
+                    "Stopping CryptoSlate index fetch: "
+                    f"{empty_pages} consecutive empty pages."
+                )
+                break
+
+        page_dates = pd.to_datetime(page_frame.get("published_date"), errors="coerce").dropna()
+        if not pd.isna(start_ts) and not page_dates.empty and page_dates.max() < start_ts.normalize():
+            older_pages += 1
+            if older_pages >= max(1, int(stop_after_older_pages)):
+                print(
+                    "Stopping CryptoSlate index fetch: "
+                    f"{older_pages} consecutive pages are older than {start_ts.date()}."
+                )
+                break
+        elif not pd.isna(end_ts) and not page_dates.empty and page_dates.min() > end_ts.normalize():
+            pass
+        else:
+            older_pages = 0
+        _polite_sleep(sleep_seconds)
+
+    out = _write_cryptoslate_archive_index(path, existing, frames)
+    print(f"saved CryptoSlate archive index: {len(out)} rows -> {path}")
+    return out
+
+
+def _cryptoslate_page_fetch_status(html_text: str) -> str:
+    text = _strip_html(html_text).lower()
+    title = (_html_title_text(html_text) or "").lower()
+    gateway_markers = (
+        "cloudflare",
+        "akamai",
+        "fastly",
+        "nginx",
+        "waf",
+    )
+
+    not_found_markers = ("page not found", "not found", "404")
+    has_not_found_marker = any(marker in text for marker in not_found_markers)
+    title_has_not_found_marker = any(marker in title for marker in not_found_markers)
+    not_found_error_context = any(
+        marker in text for marker in ("http 404", "error 404", "status code 404")
+    ) or any(marker in text for marker in gateway_markers)
+    if title_has_not_found_marker or (len(text) < 1500 and has_not_found_marker) or (
+        has_not_found_marker and not_found_error_context
+    ):
+        return "http_404"
+
+    access_markers = ("access denied", "forbidden")
+    has_access_marker = any(marker in text for marker in access_markers)
+    title_has_access_marker = any(marker in title for marker in access_markers)
+    access_error_context = any(
+        marker in text
+        for marker in ("http 401", "http 403", "error 401", "error 403", "status code 401", "status code 403")
+    ) or any(marker in text for marker in gateway_markers)
+    if title_has_access_marker or (len(text) < 1500 and has_access_marker) or (
+        has_access_marker and access_error_context
+    ):
+        return "access_denied"
+
+    rate_limit_markers = ("too many requests", "rate limited", "rate limit exceeded")
+    has_rate_limit_marker = any(marker in text for marker in rate_limit_markers)
+    title_has_rate_limit_marker = any(marker in title for marker in rate_limit_markers)
+    short_error_page = len(text) < 1500 and has_rate_limit_marker
+    gateway_context = any(
+        marker in text for marker in ("http 429", "error 429", "status code 429")
+    ) or any(marker in text for marker in gateway_markers)
+    if title_has_rate_limit_marker or short_error_page or (has_rate_limit_marker and gateway_context):
+        return "rate_limited"
+    if "checking your browser" in text and "cloudflare" in text:
+        return "cloudflare_challenge"
+    return "ok"
+
+
+def _extract_cryptoslate_asset_tags(*values: str | None) -> str | None:
+    text = " ".join(v for v in values if v)
+    if not text:
+        return None
+    symbol_aliases = {
+        "BTC": ["BTC", "Bitcoin"],
+        "ETH": ["ETH", "Ether", "Ethereum"],
+        "SOL": ["SOL", "Solana"],
+        "BNB": ["BNB", "Binance Coin", "BNB Chain"],
+        "XRP": ["XRP", "Ripple"],
+        "DOGE": ["DOGE", "Dogecoin"],
+        "LTC": ["LTC", "Litecoin"],
+        "LINK": ["LINK", "Chainlink"],
+        "TRX": ["TRX", "Tron", "TRON"],
+        "ADA": ["ADA", "Cardano"],
+        "HYPE": ["HYPE", "Hyperliquid"],
+        "XMR": ["XMR", "Monero"],
+        "ZEC": ["ZEC", "Zcash"],
+        "USDT": ["USDT", "Tether"],
+    }
+    found = []
+    for symbol, aliases in symbol_aliases.items():
+        for alias in aliases:
+            if re.search(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", text, flags=re.IGNORECASE):
+                found.append(symbol)
+                break
+    return json.dumps(found, ensure_ascii=True) if found else None
+
+
+def _extract_cryptoslate_sentiment_label(*values: str | None) -> str | None:
+    text = " ".join(v for v in values if v)
+    for label in ("Bullish", "Bearish", "Neutral"):
+        if re.search(rf"\b{label}\b", text, flags=re.IGNORECASE):
+            return label.lower()
+    return None
+
+
+def parse_cryptoslate_article_metadata(
+    html_text: str,
+    *,
+    url: str,
+    fallback_title: str | None = None,
+    fallback_published_date=None,
+    fetched_at: pd.Timestamp | None = None,
+    fetch_status: str = "ok",
+) -> dict:
+    """Extract CryptoSlate article metadata from a public article page."""
+    fetched_at = fetched_at or pd.Timestamp.utcnow().tz_localize(None)
+    json_ld = _json_objects_from_ld(html_text)
+    article_objs = [
+        obj for obj in json_ld
+        if str(obj.get("@type", "")).lower() in {"newsarticle", "article", "blogposting"}
+    ]
+    candidates = article_objs or json_ld
+
+    title = None
+    published_at = pd.NaT
+    section = None
+    author = None
+    description = None
+    keywords = None
+
+    for obj in candidates:
+        title = title or _json_text(obj, "headline", "name")
+        published_at = published_at if not pd.isna(published_at) else _parse_timestamp(obj.get("datePublished"))
+        section = section or _json_text(obj, "articleSection", "section")
+        author = author or _json_text(obj, "author", "creator")
+        description = description or _json_text(obj, "description")
+        keywords = keywords or _json_text(obj, "keywords")
+
+    title = title or _clean_text(_meta_content(html_text, {"og:title", "twitter:title"}))
+    title = title or _clean_text(fallback_title)
+    description = description or _clean_text(_meta_content(html_text, {"description", "og:description"}))
+    author = author or _clean_text(_meta_content(html_text, {"author"}))
+    section = section or _clean_text(_meta_content(html_text, {"article:section"}))
+    keywords = keywords or _clean_text(_meta_content(html_text, {"keywords", "news_keywords"}))
+
+    if pd.isna(published_at):
+        published_at = _parse_timestamp(_meta_content(html_text, {"article:published_time", "date", "pubdate"}))
+    if pd.isna(published_at):
+        published_at = _first_datetime_from_html(html_text)
+
+    published_date = _published_date_from_timestamp(published_at)
+    if pd.isna(published_date) and fallback_published_date is not None:
+        published_date = pd.to_datetime(fallback_published_date, errors="coerce")
+
+    visible_head = _strip_html(html_text[:12000])
+    status = fetch_status
+    if status == "ok" and pd.isna(published_at):
+        status = "missing_published_at"
+
+    return {
+        "url": url,
+        "title": title,
+        "published_date": published_date,
+        "published_at": published_at,
+        "section": section,
+        "author": author,
+        "description": description,
+        "asset_tags": _extract_cryptoslate_asset_tags(title, description, section, keywords, fallback_title),
+        "sentiment_label": _extract_cryptoslate_sentiment_label(title, description, keywords, visible_head[:3000]),
+        "source": "cryptoslate",
+        "fetch_status": status,
+        "fetched_at": fetched_at,
+    }
+
+
+def extract_cryptoslate_article_body(html_text: str) -> str | None:
+    """Extract CryptoSlate article body text for local offline scoring."""
+    json_ld = _json_objects_from_ld(html_text)
+    for obj in json_ld:
+        body = _json_text(obj, "articleBody")
+        if body and len(body) >= 100:
+            return body
+
+    article_blocks = _extract_tag_blocks(html_text, "article")
+    for block in article_blocks:
+        paragraphs = _paragraph_texts(block)
+        if paragraphs:
+            return "\n\n".join(paragraphs)
+
+    paragraphs = _paragraph_texts(html_text)
+    if paragraphs:
+        return "\n\n".join(paragraphs)
+    return None
+
+
+def _cryptoslate_article_body_record(
+    html_text: str,
+    *,
+    url: str,
+    fetched_at: pd.Timestamp,
+    fetch_status: str,
+) -> dict:
+    body = extract_cryptoslate_article_body(html_text) if fetch_status == "ok" else None
+    if body:
+        body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        status = "ok"
+    else:
+        body_hash = None
+        status = "missing_body" if fetch_status == "ok" else fetch_status
+
+    return {
+        "url": url,
+        "body_text": body,
+        "body_char_count": len(body) if body else 0,
+        "body_word_count": len(body.split()) if body else 0,
+        "body_hash": body_hash,
+        "source": "cryptoslate",
+        "fetch_status": status,
+        "fetched_at": fetched_at,
+    }
+
+
+def _request_error_fetch_status(error: Exception) -> str:
+    if isinstance(error, HTTPError):
+        if error.code == 404:
+            return "http_404"
+        if error.code == 429:
+            return "rate_limited"
+        if error.code in {401, 403}:
+            return "access_denied"
+        return f"http_{error.code}"
+    if isinstance(error, URLError):
+        return "error: network"
+    return _browser_error_fetch_status(error)
+
+
+def _cryptoslate_article_error_row(row: dict, *, fetched_at: pd.Timestamp, error: Exception) -> dict:
+    published_date = pd.to_datetime(row.get("published_date", pd.NaT), errors="coerce")
+    return {
+        "url": row.get("url"),
+        "title": row.get("title"),
+        "published_date": published_date,
+        "published_at": pd.NaT,
+        "section": row.get("section"),
+        "author": None,
+        "description": row.get("description"),
+        "asset_tags": None,
+        "sentiment_label": None,
+        "source": "cryptoslate",
+        "fetch_status": _request_error_fetch_status(error),
+        "fetched_at": fetched_at,
+    }
+
+
+def _within_date_range(meta: dict, *, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
+    ts = pd.to_datetime(meta.get("published_at"), errors="coerce")
+    if pd.isna(ts):
+        ts = pd.to_datetime(meta.get("published_date"), errors="coerce")
+    if pd.isna(ts):
+        return True
+    if not pd.isna(start_ts) and ts < start_ts:
+        return False
+    if not pd.isna(end_ts) and ts > end_ts:
+        return False
+    return True
+
+
+def _fetch_one_cryptoslate_article(
+    row: dict,
+    *,
+    cfg: RSSConfig,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    save_article_body: bool,
+    sleep_seconds: float,
+    timeout_seconds: int,
+) -> tuple[dict, dict | None]:
+    fetched_at = pd.Timestamp.utcnow().tz_localize(None)
+    url = str(row.get("url") or "")
+    _polite_sleep(sleep_seconds)
+    payload = _fetch_bytes(
+        url,
+        retries=cfg.retries,
+        backoff_seconds=cfg.backoff_seconds,
+        use_proxy=cfg.use_proxy,
+        accept=HTML_ACCEPT_HEADER,
+        timeout_seconds=timeout_seconds,
+    )
+    html_text = payload.decode("utf-8", errors="replace")
+    fetch_status = _cryptoslate_page_fetch_status(html_text)
+    meta = parse_cryptoslate_article_metadata(
+        html_text,
+        url=url,
+        fallback_title=row.get("title"),
+        fallback_published_date=row.get("published_date"),
+        fetched_at=fetched_at,
+        fetch_status=fetch_status,
+    )
+    if not _within_date_range(meta, start_ts=start_ts, end_ts=end_ts):
+        meta["fetch_status"] = "out_of_range"
+        return meta, None
+    body = _cryptoslate_article_body_record(
+        html_text,
+        url=url,
+        fetched_at=fetched_at,
+        fetch_status=fetch_status,
+    ) if save_article_body else None
+    return meta, body
+
+
+def fetch_cryptoslate_article_details(
+    archive_index: pd.DataFrame | None = None,
+    *,
+    start_date: str | pd.Timestamp | None = None,
+    end_date: str | pd.Timestamp | None = None,
+    limit: int | None = None,
+    append: bool = True,
+    details_path: str | Path | None = None,
+    body_path: str | Path | None = None,
+    workers: int = 4,
+    progress_save_every: int = 100,
+    save_article_body: bool = True,
+    sleep_seconds: float = 0.2,
+    rate_limit_threshold: int = 2,
+    rate_limit_sleep_multiplier: float = 1.8,
+    max_sleep_seconds: float = 5.0,
+    article_timeout_seconds: int = 90,
+    cfg: RSSConfig | None = None,
+) -> pd.DataFrame:
+    """Fetch CryptoSlate article-page metadata/body text over public HTTP."""
+    cfg = cfg or RSSConfig()
+    start_ts = _parse_timestamp(start_date) if start_date is not None else pd.NaT
+    end_ts = _parse_timestamp(end_date) if end_date is not None else pd.NaT
+    if archive_index is None:
+        archive_path = config.PathConfig.RAW_SENTIMENT / config.SentimentConfig.CRYPTOSLATE_ARCHIVE_OUTPUT_NAME
+        if not archive_path.exists():
+            raise FileNotFoundError(f"CryptoSlate archive index not found: {archive_path}")
+        archive_index = pd.read_parquet(archive_path)
+    archive_index = _dedupe_cryptoslate_archive(archive_index)
+
+    out_path = Path(details_path) if details_path else (
+        config.PathConfig.RAW_SENTIMENT / config.SentimentConfig.CRYPTOSLATE_ARTICLE_DETAIL_OUTPUT_NAME
+    )
+    body_out_path = Path(body_path) if body_path else (
+        config.PathConfig.RAW_SENTIMENT / config.SentimentConfig.CRYPTOSLATE_ARTICLE_BODY_OUTPUT_NAME
+    )
+    detail_parts_dir = _coindesk_parts_dir(out_path)
+    body_parts_dir = _coindesk_parts_dir(body_out_path)
+
+    if append:
+        existing = _load_coindesk_table_with_parts(
+            out_path,
+            detail_parts_dir,
+            CRYPTOSLATE_ARTICLE_COLUMNS,
+            _dedupe_cryptoslate_article_details,
+        )
+        existing_bodies = _load_coindesk_table_with_parts(
+            body_out_path,
+            body_parts_dir,
+            CRYPTOSLATE_ARTICLE_BODY_COLUMNS,
+            _dedupe_cryptoslate_article_bodies,
+        ) if save_article_body else pd.DataFrame(columns=CRYPTOSLATE_ARTICLE_BODY_COLUMNS)
+    else:
+        existing = pd.DataFrame(columns=CRYPTOSLATE_ARTICLE_COLUMNS)
+        existing_bodies = pd.DataFrame(columns=CRYPTOSLATE_ARTICLE_BODY_COLUMNS)
+
+    done_urls = _completed_cryptoslate_article_urls(existing, existing_bodies, save_article_body=save_article_body)
+    existing_rows = len(existing)
+    completed_rows = len(done_urls)
+    retry_existing_urls: set[str] = set()
+    existing_status_by_url: dict[str, str] = {}
+    if existing is not None and not existing.empty and "url" in existing.columns:
+        retry_existing_urls = set(existing.loc[~existing["url"].isin(done_urls), "url"].dropna())
+        if "fetch_status" in existing.columns:
+            existing_status_by_url = {
+                str(row.url): str(row.fetch_status)
+                for row in existing[["url", "fetch_status"]].dropna(subset=["url"]).itertuples(index=False)
+            }
+    rows_df = archive_index.dropna(subset=["url"]).copy()
+    if "published_date" in rows_df.columns:
+        row_dates = pd.to_datetime(rows_df["published_date"], errors="coerce")
+        if not pd.isna(start_ts):
+            rows_df = rows_df[row_dates.isna() | (row_dates >= start_ts.normalize())].copy()
+            row_dates = pd.to_datetime(rows_df["published_date"], errors="coerce")
+        if not pd.isna(end_ts):
+            rows_df = rows_df[row_dates.isna() | (row_dates <= end_ts.normalize())].copy()
+    if done_urls:
+        rows_df = rows_df[~rows_df["url"].isin(done_urls)].copy()
+    if limit is not None:
+        rows_df = rows_df.head(int(limit)).copy()
+
+    print(
+        "CryptoSlate article detail candidates: "
+        f"{len(rows_df)} | existing_rows={existing_rows} | completed_urls={completed_rows} | "
+        f"retry_urls={len(retry_existing_urls)} | limit={limit if limit is not None else '-'}"
+    )
+    if rows_df.empty:
+        return _dedupe_cryptoslate_article_details(existing)
+
+    records: list[dict] = []
+    body_records: list[dict] = []
+    pending_since_write = 0
+    rows = rows_df.to_dict("records")
+    max_workers = max(1, int(workers))
+    base_sleep_seconds = max(0.0, float(sleep_seconds))
+    adaptive_sleep_seconds = base_sleep_seconds
+    consecutive_rate_limited = 0
+    clean_batches = 0
+    completed_count = 0
+    status_counts: dict[str, int] = {}
+    latest_status_by_url = dict(existing_status_by_url)
+    started_at = time.monotonic()
+    progress_log_every = 50
+
+    def flush_parts() -> None:
+        nonlocal pending_since_write
+        if not records:
+            return
+        detail_count = len(records)
+        body_count = len(body_records)
+        detail_part = _write_coindesk_part(detail_parts_dir, records, CRYPTOSLATE_ARTICLE_COLUMNS, "details")
+        body_part = None
+        if save_article_body and body_records:
+            body_part = _write_coindesk_part(body_parts_dir, body_records, CRYPTOSLATE_ARTICLE_BODY_COLUMNS, "bodies")
+        print(
+            "CryptoSlate checkpoint saved: "
+            f"details={detail_count} -> {detail_part.name if detail_part else '-'} | "
+            f"bodies={body_count} -> {body_part.name if body_part else '-'}"
+        )
+        records.clear()
+        body_records.clear()
+        pending_since_write = 0
+
+    def log_progress(reason: str) -> None:
+        elapsed = max(0.001, time.monotonic() - started_at)
+        rate_per_min = completed_count / elapsed * 60.0
+        remaining = max(0, len(rows) - completed_count)
+        eta_seconds = remaining / (rate_per_min / 60.0) if rate_per_min > 0 else None
+        status_summary = ", ".join(
+            f"{status}={count}"
+            for status, count in sorted(status_counts.items(), key=lambda item: (-item[1], item[0]))
+            if status not in CRYPTOSLATE_PROGRESS_HIDDEN_STATUSES
+        ) or "-"
+        total_status_counts: dict[str, int] = {}
+        for status in latest_status_by_url.values():
+            total_status_counts[status] = total_status_counts.get(status, 0) + 1
+        total_status_summary = ", ".join(
+            f"{status}={count}"
+            for status, count in sorted(total_status_counts.items(), key=lambda item: (-item[1], item[0]))
+            if status not in CRYPTOSLATE_PROGRESS_HIDDEN_STATUSES
+        ) or "-"
+        retry_remaining = sum(
+            1
+            for url in retry_existing_urls
+            if latest_status_by_url.get(url) not in CRYPTOSLATE_TERMINAL_DETAIL_STATUSES
+        )
+        print(
+            f"CryptoSlate progress ({reason}): {completed_count}/{len(rows)} "
+            f"({completed_count / max(1, len(rows)):.1%}) | "
+            f"elapsed={_format_duration(elapsed)} | eta={_format_duration(eta_seconds)} | "
+            f"rate={rate_per_min:.1f}/min | sleep={adaptive_sleep_seconds:.2f}s | "
+            f"retry_left={retry_remaining} | pending_checkpoint={pending_since_write} | "
+            f"run_statuses: {status_summary} | total_est: {total_status_summary}"
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for batch_start in range(0, len(rows), max_workers):
+                batch = rows[batch_start:batch_start + max_workers]
+                futures = {
+                    executor.submit(
+                        _fetch_one_cryptoslate_article,
+                        row,
+                        cfg=cfg,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        save_article_body=save_article_body,
+                        sleep_seconds=adaptive_sleep_seconds,
+                        timeout_seconds=article_timeout_seconds,
+                    ): row
+                    for row in batch
+                }
+                rate_limited_in_batch = 0
+
+                for future in as_completed(futures):
+                    row = futures[future]
+                    try:
+                        meta, body = future.result()
+                    except Exception as exc:
+                        fetched_at = pd.Timestamp.utcnow().tz_localize(None)
+                        meta = _cryptoslate_article_error_row(row, fetched_at=fetched_at, error=exc)
+                        body = None
+                        print(f"[WARN] CryptoSlate article skipped: {row.get('url')} | {exc}")
+
+                    status = str(meta.get("fetch_status") or "")
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                    meta_url = meta.get("url")
+                    if meta_url:
+                        latest_status_by_url[str(meta_url)] = status
+                    if status == "rate_limited":
+                        rate_limited_in_batch += 1
+                        consecutive_rate_limited += 1
+                    elif status in CRYPTOSLATE_PROGRESS_HIDDEN_STATUSES:
+                        consecutive_rate_limited = 0
+                        print(
+                            "CryptoSlate terminal article status: "
+                            f"{status} | {meta.get('url')}"
+                        )
+                    elif status not in {"ok", "out_of_range"}:
+                        consecutive_rate_limited = 0
+                        print(
+                            "[WARN] CryptoSlate non-ok article status: "
+                            f"{status} | {meta.get('url')}"
+                        )
+                    else:
+                        consecutive_rate_limited = 0
+
+                    records.append(meta)
+                    if body is not None:
+                        body_records.append(body)
+                    pending_since_write += 1
+                    completed_count += 1
+
+                    if completed_count % progress_log_every == 0:
+                        log_progress("interval")
+                    if pending_since_write >= max(1, int(progress_save_every)):
+                        flush_parts()
+
+                threshold = max(1, int(rate_limit_threshold))
+                if 0 < rate_limited_in_batch < threshold:
+                    print(
+                        "[WARN] CryptoSlate rate limit seen below threshold: "
+                        f"batch_rate_limited={rate_limited_in_batch}, "
+                        f"threshold={threshold}, sleep={adaptive_sleep_seconds:.2f}s"
+                    )
+                if rate_limited_in_batch >= threshold or consecutive_rate_limited >= threshold:
+                    old_sleep = adaptive_sleep_seconds
+                    adaptive_sleep_seconds = min(
+                        max(0.0, float(max_sleep_seconds)),
+                        max(
+                            adaptive_sleep_seconds * float(rate_limit_sleep_multiplier),
+                            adaptive_sleep_seconds + max(0.5, base_sleep_seconds),
+                        ),
+                    )
+                    clean_batches = 0
+                    consecutive_rate_limited = 0
+                    print(
+                        "[WARN] CryptoSlate rate limit pressure detected: "
+                        f"batch_rate_limited={rate_limited_in_batch}, "
+                        f"sleep {old_sleep:.2f}s -> {adaptive_sleep_seconds:.2f}s"
+                    )
+                    log_progress("rate_limit")
+                    _polite_sleep(adaptive_sleep_seconds)
+                elif rate_limited_in_batch == 0:
+                    clean_batches += 1
+                    if clean_batches >= 10 and adaptive_sleep_seconds > base_sleep_seconds:
+                        old_sleep = adaptive_sleep_seconds
+                        adaptive_sleep_seconds = max(base_sleep_seconds, adaptive_sleep_seconds * 0.8)
+                        clean_batches = 0
+                        print(
+                            "CryptoSlate rate limit pressure cooled: "
+                            f"sleep {old_sleep:.2f}s -> {adaptive_sleep_seconds:.2f}s"
+                        )
+                        log_progress("cooldown")
+    finally:
+        flush_parts()
+        log_progress("final")
+
+    out = _load_coindesk_table_with_parts(
+        out_path,
+        detail_parts_dir,
+        CRYPTOSLATE_ARTICLE_COLUMNS,
+        _dedupe_cryptoslate_article_details,
+    )
+    if save_article_body:
+        _load_coindesk_table_with_parts(
+            body_out_path,
+            body_parts_dir,
+            CRYPTOSLATE_ARTICLE_BODY_COLUMNS,
+            _dedupe_cryptoslate_article_bodies,
+        )
+    print(f"saved CryptoSlate article details checkpoint parts -> {detail_parts_dir}")
+    return out
+
+
+def compact_cryptoslate_article_outputs(
+    *,
+    details_path: str | Path | None = None,
+    body_path: str | Path | None = None,
+    delete_parts: bool = False,
+) -> pd.DataFrame:
+    details = Path(details_path) if details_path else (
+        config.PathConfig.RAW_SENTIMENT / config.SentimentConfig.CRYPTOSLATE_ARTICLE_DETAIL_OUTPUT_NAME
+    )
+    detail_parts = _coindesk_parts_dir(details)
+    detail_main = pd.read_parquet(details) if details.exists() else pd.DataFrame(columns=CRYPTOSLATE_ARTICLE_COLUMNS)
+    detail_part_files = sorted(detail_parts.glob("*.parquet")) if detail_parts.exists() else []
+    detail_parts_df = (
+        pd.concat([pd.read_parquet(p) for p in detail_part_files], ignore_index=True)
+        if detail_part_files else pd.DataFrame(columns=CRYPTOSLATE_ARTICLE_COLUMNS)
+    )
+    _print_compact_part_summary(
+        label="CryptoSlate article details",
+        main_df=detail_main,
+        parts_df=detail_parts_df,
+        part_files=detail_part_files,
+    )
+    detail_frames = [detail_main] + ([detail_parts_df] if not detail_parts_df.empty else [])
+    detail_out = _dedupe_cryptoslate_article_details(
+        pd.concat(detail_frames, ignore_index=True)
+    )
+    _write_parquet_atomic(details, detail_out)
+    if delete_parts:
+        _delete_parquet_files(detail_part_files)
+
+    if body_path is not None:
+        body = Path(body_path)
+    else:
+        body = config.PathConfig.RAW_SENTIMENT / config.SentimentConfig.CRYPTOSLATE_ARTICLE_BODY_OUTPUT_NAME
+    body_parts = _coindesk_parts_dir(body)
+    body_main = pd.read_parquet(body) if body.exists() else pd.DataFrame(columns=CRYPTOSLATE_ARTICLE_BODY_COLUMNS)
+    body_part_files = sorted(body_parts.glob("*.parquet")) if body_parts.exists() else []
+    body_parts_df = (
+        pd.concat([pd.read_parquet(p) for p in body_part_files], ignore_index=True)
+        if body_part_files else pd.DataFrame(columns=CRYPTOSLATE_ARTICLE_BODY_COLUMNS)
+    )
+    _print_compact_part_summary(
+        label="CryptoSlate article bodies",
+        main_df=body_main,
+        parts_df=body_parts_df,
+        part_files=body_part_files,
+    )
+    body_frames = [body_main] + ([body_parts_df] if not body_parts_df.empty else [])
+    body_out = _dedupe_cryptoslate_article_bodies(
+        pd.concat(body_frames, ignore_index=True)
+    )
+    _write_parquet_atomic(body, body_out)
+    if delete_parts:
+        _delete_parquet_files(body_part_files)
+
+    print(f"compacted CryptoSlate article details: {len(detail_out)} rows -> {details}")
+    print(f"compacted CryptoSlate article bodies: {len(body_out)} rows -> {body}")
+
+    return detail_out
+
+
+def _print_compact_part_summary(
+    *,
+    label: str,
+    main_df: pd.DataFrame,
+    parts_df: pd.DataFrame,
+    part_files: list[Path],
+) -> None:
+    main_urls = set(main_df["url"].dropna()) if main_df is not None and "url" in main_df.columns else set()
+    part_urls = set(parts_df["url"].dropna()) if parts_df is not None and "url" in parts_df.columns else set()
+    new_urls = part_urls - main_urls
+    overlap_urls = part_urls & main_urls
+    print(
+        f"compact source summary - {label}: "
+        f"part_files={len(part_files)} | part_rows={len(parts_df)} | "
+        f"part_unique_urls={len(part_urls)} | new_urls={len(new_urls)} | "
+        f"overlap_urls={len(overlap_urls)} | existing_rows={len(main_df)}"
+    )
+
+
+def _completed_cryptoslate_archive_pages(df: pd.DataFrame) -> set[int]:
+    if df is None or df.empty or "archive_page" not in df.columns:
+        return set()
+    pages = pd.to_numeric(df["archive_page"], errors="coerce").dropna()
+    return {int(page) for page in pages}
+
+
+def _completed_cryptoslate_article_urls(
+    details: pd.DataFrame,
+    bodies: pd.DataFrame,
+    *,
+    save_article_body: bool,
+) -> set[str]:
+    if details is None or details.empty or "fetch_status" not in details.columns:
+        return set()
+    terminal_details = details[
+        details["fetch_status"].isin(CRYPTOSLATE_TERMINAL_DETAIL_STATUSES)
+    ][["url", "fetch_status"]].dropna(subset=["url"])
+    if terminal_details.empty:
+        return set()
+
+    no_body_needed = set(
+        terminal_details.loc[
+            terminal_details["fetch_status"].isin({"http_404", "out_of_range"}),
+            "url",
+        ]
+    )
+    ok_detail_urls = set(terminal_details.loc[terminal_details["fetch_status"].eq("ok"), "url"])
+    if not save_article_body:
+        return no_body_needed | ok_detail_urls
+    if bodies is None or bodies.empty or "fetch_status" not in bodies.columns:
+        return no_body_needed
+    ok_body_urls = set(bodies.loc[bodies["fetch_status"].eq("ok"), "url"].dropna())
+    return no_body_needed | (ok_detail_urls & ok_body_urls)
+
+
+def _write_cryptoslate_archive_index(
+    path: Path,
+    existing: pd.DataFrame,
+    frames: list[pd.DataFrame],
+) -> pd.DataFrame:
+    parts = [existing] + [frame for frame in frames if frame is not None and not frame.empty]
+    out = _dedupe_cryptoslate_archive(pd.concat(parts, ignore_index=True)) if parts else pd.DataFrame(columns=CRYPTOSLATE_ARCHIVE_COLUMNS)
+    _write_parquet_atomic(path, out)
+    return out
+
+
+def _dedupe_cryptoslate_archive(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=CRYPTOSLATE_ARCHIVE_COLUMNS)
+    out = df.copy()
+    for col in CRYPTOSLATE_ARCHIVE_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    out["published_date"] = pd.to_datetime(out["published_date"], errors="coerce")
+    out["archive_page"] = pd.to_numeric(out["archive_page"], errors="coerce").astype("Int64")
+    out["fetched_at"] = pd.to_datetime(out["fetched_at"], errors="coerce")
+    out = out.drop_duplicates(subset=["url"], keep="last")
+    return out[CRYPTOSLATE_ARCHIVE_COLUMNS].sort_values(
+        ["archive_page", "published_date", "url"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def _dedupe_cryptoslate_article_details(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=CRYPTOSLATE_ARTICLE_COLUMNS)
+    out = df.copy()
+    for col in CRYPTOSLATE_ARTICLE_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    out["published_date"] = pd.to_datetime(out["published_date"], errors="coerce")
+    out["published_at"] = pd.to_datetime(out["published_at"], errors="coerce")
+    out["fetched_at"] = pd.to_datetime(out["fetched_at"], errors="coerce")
+    out = out.drop_duplicates(subset=["url"], keep="last")
+    return out[CRYPTOSLATE_ARTICLE_COLUMNS].sort_values(
+        ["published_at", "published_date", "url"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def _dedupe_cryptoslate_article_bodies(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=CRYPTOSLATE_ARTICLE_BODY_COLUMNS)
+    out = df.copy()
+    for col in CRYPTOSLATE_ARTICLE_BODY_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    out["fetched_at"] = pd.to_datetime(out["fetched_at"], errors="coerce")
+    out["body_char_count"] = pd.to_numeric(out["body_char_count"], errors="coerce").fillna(0).astype(int)
+    out["body_word_count"] = pd.to_numeric(out["body_word_count"], errors="coerce").fillna(0).astype(int)
+    out = out.drop_duplicates(subset=["url"], keep="last")
+    return out[CRYPTOSLATE_ARTICLE_BODY_COLUMNS].sort_values(
+        ["fetched_at", "url"],
         na_position="last",
     ).reset_index(drop=True)
 
