@@ -246,23 +246,103 @@ def _risk_sleeve_combine(close_panel, w_a, w_b, bars_per_year, fcfg, target_vol=
             + sb * w_b.reindex(index=idx, columns=cols).fillna(0.0))
 
 
-def _fusion_alpha(df, modality_cols, fcfg, splits):
-    """Leakage-free fusion: mean of each modality's OOF combined_alpha (z-scored).
-    (A *fitted* meta-combiner would require nested CV; this unfitted combiner is a
-    clean 'fusion vs single-model' comparison.)  Returns (fused_alpha, base_oof)."""
+def _xs_ic_tstat(a, fwd, times, idx) -> float:
+    """Per-period CROSS-SECTIONAL rank-IC t-stat: demean alpha and fwd-return ACROSS
+    SYMBOLS within each decision_time, correlate, then t = mean(IC)/se(IC) over periods.
+    A common-mode signal (identical across symbols) demeans to ~0 -> t~0, so this is the
+    correct 'skill' metric for a dollar-neutral book. `idx` restricts to (train) rows."""
+    a = np.asarray(a, float); fwd = np.asarray(fwd, float)
+    m = ~(np.isnan(a) | np.isnan(fwd))
+    sel = np.zeros(len(a), bool); sel[np.asarray(idx, int)] = True; m &= sel
+    if m.sum() < 30:
+        return 0.0
+    d = pd.DataFrame({"t": pd.Series(times)[m].to_numpy(), "a": a[m], "f": fwd[m]})
+    d["ra"] = d.groupby("t")["a"].rank()
+    d["rf"] = d.groupby("t")["f"].rank()
+    d["da"] = d["ra"] - d.groupby("t")["ra"].transform("mean")
+    d["dfd"] = d["rf"] - d.groupby("t")["rf"].transform("mean")
+    g = (d.assign(dadf=d["da"] * d["dfd"], da2=d["da"] ** 2, df2=d["dfd"] ** 2)
+         .groupby("t")[["dadf", "da2", "df2"]].sum())
+    ic = (g["dadf"] / np.sqrt(g["da2"] * g["df2"])).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(ic) < 5 or ic.std(ddof=1) < 1e-12:
+        return 0.0
+    return float(ic.mean() / (ic.std(ddof=1) / np.sqrt(len(ic))))
+
+
+def _cm_ic_tstat(a, fwd, times, idx) -> float:
+    """Common-mode / time-series IC t-stat: does the per-period MEAN alpha (the
+    cross-sectional average = 'market sentiment') predict the per-period MEAN forward
+    return ('market move') over time? High here WITH low _xs_ic_tstat => the signal is
+    common-mode/timing (like global on-chain), not a cross-sectional ranker."""
+    a = np.asarray(a, float); fwd = np.asarray(fwd, float)
+    m = ~(np.isnan(a) | np.isnan(fwd))
+    sel = np.zeros(len(a), bool); sel[np.asarray(idx, int)] = True; m &= sel
+    if m.sum() < 30:
+        return 0.0
+    d = pd.DataFrame({"t": pd.Series(times)[m].to_numpy(), "a": a[m], "f": fwd[m]}).groupby("t").mean()
+    if len(d) < 5 or d["a"].std() < 1e-12 or d["f"].std() < 1e-12:
+        return 0.0
+    r = float(np.corrcoef(d["a"], d["f"])[0, 1])
+    n = len(d)
+    if not np.isfinite(r) or abs(r) >= 1.0:
+        return 0.0
+    return float(r * np.sqrt((n - 2) / (1.0 - r ** 2)))
+
+
+def _fusion_alpha(df, modality_cols, fcfg, splits, fwd=None, xs=False):
+    """Leakage-free fusion of per-modality OOF alphas. Returns (fused, base_oof, weights).
+
+    * Cross-sectional (xs_neutral) book: weight each modality by its CROSS-SECTIONAL
+      skill, computed PER FOLD on the TRAIN rows only (zero look-ahead) and applied to the
+      TEST rows. weight_m = max(0, train xs-IC t-stat), renormalized; if no modality has
+      positive cross-sectional skill, fall back to equal weight. This (a) needs no arbitrary
+      t threshold, (b) auto-downweights a weak modality (narrative) instead of letting equal
+      weighting halve the strong one, and (c) gives ~0 weight to a common-mode modality
+      (on-chain) whose cross-sectional skill is ~0 -- so it cannot sneak into the neutral book.
+    * Directional (vol_parity / simple) book or a single modality: plain z-scored equal
+      weight (unchanged), since the deliverable is the cross-sectional book.
+    A *fitted* meta-combiner would need nested CV; this rule-based combiner stays a clean
+    'fusion vs single-model' comparison."""
     base = {}
     for mod, cols in modality_cols.items():
         if cols:
             base[mod] = _oof_alpha(df, cols, fcfg, splits)
     if not base:
-        return np.full(len(df), np.nan), {}
-    mat = []
-    for a in base.values():
-        s = np.nan_to_num(a)
-        sd = s.std()
-        mat.append(s / sd if sd > 1e-12 else s)
-    fused = np.mean(np.column_stack(mat), axis=1)
-    return fused, base
+        return np.full(len(df), np.nan), {}, {}
+    mods = list(base.keys())
+
+    if not xs or fwd is None or len(mods) == 1:
+        mat = []
+        for m in mods:
+            s = np.nan_to_num(base[m]); sd = s.std()
+            mat.append(s / sd if sd > 1e-12 else s)
+        fused = np.mean(np.column_stack(mat), axis=1)
+        return fused, base, {m: 1.0 / len(mods) for m in mods}
+
+    times = df["decision_time"].to_numpy()
+    fused = np.full(len(df), np.nan)
+    wlog = {m: [] for m in mods}
+    for fo in splits:
+        tr, te = fo.train_idx, fo.test_idx
+        if len(tr) < 30 or len(te) == 0:
+            continue
+        ws, ztest = {}, {}
+        for m in mods:
+            a = base[m]
+            sd = np.nanstd(a[tr]); sd = sd if sd > 1e-12 else 1.0
+            ztest[m] = np.nan_to_num(a[te]) / sd
+            ws[m] = max(0.0, _xs_ic_tstat(a, fwd, times, tr))   # TRAIN-only skill
+        tot = sum(ws.values())
+        if tot <= 0:                                            # no xs skill -> equal weight
+            ws = {m: 1.0 for m in mods}; tot = float(len(mods))
+        acc = np.zeros(len(te))
+        for m in mods:
+            wn = ws[m] / tot
+            acc += wn * ztest[m]
+            wlog[m].append(wn)
+        fused[te] = acc
+    weights = {m: (float(np.mean(wlog[m])) if wlog[m] else 0.0) for m in mods}
+    return fused, base, weights
 
 
 def _meta_gate(df, fused_alpha, base_oof, fcfg, splits):
@@ -372,9 +452,27 @@ def run_incremental_study(
     fusion_mods = {"market": mk, "narrative": nv}
     if not xs:
         fusion_mods["onchain"] = oc
-    fused, base_oof = _fusion_alpha(df, fusion_mods, fcfg, splits)
+    fused, base_oof, fusion_w = _fusion_alpha(df, fusion_mods, fcfg, splits, fwd=fwd, xs=xs)
     r5, t5, c5 = deploy(fused)
     steps.append(("Step5_fusion", fused, r5, t5, c5))
+    if xs:
+        print("    [Step5 fusion] cross-sectional skill weights (per-fold, train->test): "
+              + ", ".join(f"{m}={fusion_w.get(m, 0.0):.2f}" for m in fusion_mods if fusion_mods[m]))
+
+    # Narrative decomposition diagnostic (no tuning, no deployment change): is the news
+    # signal a cross-sectional ranker, a common-mode timer (like global on-chain), or noise?
+    narr_diag = None
+    if nv:
+        nv_alpha = base_oof.get("narrative")
+        if nv_alpha is None:
+            nv_alpha = _oof_alpha(df, nv, fcfg, splits)
+        full = np.arange(len(df))
+        narr_diag = {"xs_ic_t": _xs_ic_tstat(nv_alpha, fwd, df["decision_time"].to_numpy(), full),
+                     "cm_ic_t": _cm_ic_tstat(nv_alpha, fwd, df["decision_time"].to_numpy(), full)}
+        verdict = ("no signal" if abs(narr_diag["xs_ic_t"]) < 2 and abs(narr_diag["cm_ic_t"]) < 2
+                   else "common-mode/timing" if abs(narr_diag["xs_ic_t"]) < 2 else "cross-sectional")
+        print(f"    [narrative diagnostic] cross-sectional IC t={narr_diag['xs_ic_t']:.2f}  "
+              f"vs common-mode/time-series IC t={narr_diag['cm_ic_t']:.2f}  -> {verdict}")
 
     # Step6 meta gate. The meta-label scores whether a DIRECTIONAL bet pays off net of
     # cost -> it is a directional concept. In xs_neutral we SHOW its neutral-aware form
@@ -490,4 +588,7 @@ def run_incremental_study(
 
     out = pd.DataFrame(rows).set_index("step")
     out.attrs["returns_by_step"] = returns_by_step       # for per-year stability diagnostic
+    out.attrs["fusion_weights"] = fusion_w               # cross-sectional skill weights per modality
+    if narr_diag is not None:
+        out.attrs["narrative_diag"] = narr_diag          # xs-IC t vs common-mode-IC t
     return out
