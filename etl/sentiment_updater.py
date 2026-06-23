@@ -2167,12 +2167,22 @@ def fetch_cryptoslate_archive_index(
     frames: list[pd.DataFrame] = []
     older_pages = 0
     empty_pages = 0
+    skipped_completed_pages = 0
+    fetched_pages = 0
 
     for page in range(1, page_limit + 1):
         page_url = _cryptoslate_news_url(page)
         if page in completed_pages:
-            print(f"Skipping CryptoSlate index page already saved: {page}/{page_limit}")
+            skipped_completed_pages += 1
+            if skipped_completed_pages == 1 or skipped_completed_pages % 100 == 0:
+                print(
+                    "Skipping already-saved CryptoSlate index pages: "
+                    f"{skipped_completed_pages} so far (latest page={page})"
+                )
             continue
+        if skipped_completed_pages:
+            print(f"Skipped already-saved CryptoSlate index pages: {skipped_completed_pages}")
+            skipped_completed_pages = 0
 
         print(f"Fetching CryptoSlate index page: {page}/{page_limit} | {page_url}")
         try:
@@ -2198,6 +2208,7 @@ def fetch_cryptoslate_archive_index(
             frames.append(page_frame)
             _write_cryptoslate_archive_index(path, existing, frames)
             empty_pages = 0
+            fetched_pages += 1
         else:
             empty_pages += 1
             print(f"[WARN] CryptoSlate index page had no article URLs: {page_url}")
@@ -2223,8 +2234,13 @@ def fetch_cryptoslate_archive_index(
             older_pages = 0
         _polite_sleep(sleep_seconds)
 
+    if skipped_completed_pages:
+        print(f"Skipped already-saved CryptoSlate index pages: {skipped_completed_pages}")
     out = _write_cryptoslate_archive_index(path, existing, frames)
-    print(f"saved CryptoSlate archive index: {len(out)} rows -> {path}")
+    print(
+        f"saved CryptoSlate archive index: {len(out)} rows -> {path} "
+        f"(new_pages_fetched={fetched_pages})"
+    )
     return out
 
 

@@ -63,6 +63,7 @@ chrome_cdp_profile = "powershell -ExecutionPolicy Bypass -File scripts/show_chro
 coindesk_access = "python scripts/check_coindesk_access.py"
 coindesk_compact = "python scripts/compact_coindesk_articles.py"
 cryptoslate_compact = "python scripts/compact_cryptoslate_articles.py"
+sentiment_llm_dataset = "python scripts/build_sentiment_llm_dataset.py"
 feature = "python main.py --mode crypto --skip-market --build-features --feature-builder multimodal"
 realdata = "python run_on_real_data.py"
 experiment = "python run_on_real_data.py --symbols BTC/USDT ETH/USDT SOL/USDT BNB/USDT"

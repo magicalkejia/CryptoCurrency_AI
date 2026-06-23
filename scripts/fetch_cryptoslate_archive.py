@@ -37,7 +37,7 @@ COMPACT_ONLY = False
 MAX_ARCHIVE_PAGES = 1500
 STOP_AFTER_OLDER_PAGES = 1
 STOP_AFTER_EMPTY_PAGES = 1
-INDEX_SLEEP_SECONDS = 0.5
+INDEX_SLEEP_SECONDS = 0.05
 
 # First network test cap. Set to None after confirming pagination / body
 # extraction on a few hundred rows.
