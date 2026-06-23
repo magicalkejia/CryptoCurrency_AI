@@ -17,6 +17,7 @@ Two backends, identical interface:
 """
 from __future__ import annotations
 
+import os
 from typing import List, Optional
 
 import numpy as np
@@ -32,6 +33,32 @@ try:
     _HAS_TORCH = True
 except Exception:
     _HAS_TORCH = False
+
+
+def _resolve_backend(prefer: str) -> str:
+    """Decide which PatchTST backend to use.
+
+    'fallback'  -> always the fast sklearn TemporalFallback.
+    'torch'     -> real PatchTST if torch is importable, else fallback.
+    'auto'      -> real PatchTST ONLY when a CUDA GPU is present; otherwise fallback.
+
+    Rationale: the torch PatchTST trains a transformer per fold per symbol, which is
+    extremely slow on CPU and would also silently change results the moment torch is
+    installed for an unrelated reason (e.g. CryptoBERT). Gating 'auto' on CUDA keeps
+    CPU machines fast and reproducible, and uses the GPU automatically on a server.
+    Override with the env var CRYPTO_PATCHTST_BACKEND = auto | torch | fallback.
+    """
+    env = os.getenv("CRYPTO_PATCHTST_BACKEND", "").strip().lower()
+    if env in ("auto", "torch", "fallback"):
+        prefer = env
+    if prefer == "fallback" or not _HAS_TORCH:
+        return "fallback"
+    if prefer == "torch":
+        return "torch"
+    try:                                   # prefer == 'auto': GPU only
+        return "torch" if torch.cuda.is_available() else "fallback"
+    except Exception:
+        return "fallback"
 
 
 # --------------------------------------------------------------------------- #
@@ -146,34 +173,45 @@ if _HAS_TORCH:
             return self.fc_head(emb), emb
 
     class PatchTSTTorch:
-        def __init__(self, lookback, n_ch, emb_dim=8, epochs=30, lr=1e-3, seed=42):
+        def __init__(self, lookback, n_ch, emb_dim=8, epochs=30, lr=1e-3, seed=42,
+                     batch_size=256):
             torch.manual_seed(seed)
             self.lookback, self.n_ch, self.emb_dim = lookback, n_ch, emb_dim
-            self.epochs, self.lr = epochs, lr
+            self.epochs, self.lr, self.batch_size = epochs, lr, batch_size
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
             self.model = None
 
         def fit(self, X, tgts):
             self.model = _PatchTST(self.n_ch, self.lookback, emb_dim=self.emb_dim,
-                                   n_horizons=len(HORIZONS_H))
+                                   n_horizons=len(HORIZONS_H)).to(self.device)
             Y = np.stack([tgts[h] for h in HORIZONS_H], axis=1)
             xb = torch.tensor(X, dtype=torch.float32)
             yb = torch.tensor(Y, dtype=torch.float32)
+            ds = torch.utils.data.TensorDataset(xb, yb)
+            dl = torch.utils.data.DataLoader(ds, batch_size=self.batch_size, shuffle=True)
             opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
             lossf = nn.MSELoss()
             self.model.train()
             for _ in range(self.epochs):
-                opt.zero_grad()
-                pred, _ = self.model(xb)
-                loss = lossf(pred, yb)
-                loss.backward()
-                opt.step()
+                for xbb, ybb in dl:
+                    xbb, ybb = xbb.to(self.device), ybb.to(self.device)
+                    opt.zero_grad()
+                    pred, _ = self.model(xbb)
+                    loss = lossf(pred, ybb)
+                    loss.backward()
+                    opt.step()
             return self
 
         def predict(self, X):
             self.model.eval()
+            fcs, embs = [], []
             with torch.no_grad():
-                pred, emb = self.model(torch.tensor(X, dtype=torch.float32))
-            pred, emb = pred.numpy(), emb.numpy()
+                for i in range(0, len(X), self.batch_size):
+                    xb = torch.tensor(X[i:i + self.batch_size], dtype=torch.float32).to(self.device)
+                    pred, emb = self.model(xb)
+                    fcs.append(pred.cpu().numpy())
+                    embs.append(emb.cpu().numpy())
+            pred, emb = np.concatenate(fcs), np.concatenate(embs)
             fc = {f"patchtst_forecast_{h}": pred[:, i] for i, h in enumerate(HORIZONS_H)}
             return fc, emb
 
@@ -216,7 +254,7 @@ def run_patchtst(
     fc_oof = {f"patchtst_forecast_{h}": np.full(n, np.nan) for h in HORIZONS_H}
     emb_oof = np.full((n, emb_dim), np.nan)
 
-    use_torch = _HAS_TORCH and prefer in ("auto", "torch")
+    use_torch = (_resolve_backend(prefer) == "torch")
     for fold in splits:
         tr, te = fold.train_idx, fold.test_idx
         if len(tr) < 50 or len(te) == 0:

@@ -48,13 +48,14 @@ def attach_narrative(dataset: pd.DataFrame, modality_cols: dict, narr_feats: pd.
     if getattr(dt.dt, "tz", None) is not None:
         dt = dt.dt.tz_convert("UTC").dt.tz_localize(None)
     dataset["_tkr"] = dataset[symbol_col].map(_base_ticker)
-    dataset["_asof"] = dt - pd.Timedelta(minutes=int(buffer_min))
+    # cast asof keys to a single common resolution (ns); merge_asof requires identical dtype
+    dataset["_asof"] = (dt - pd.Timedelta(minutes=int(buffer_min))).astype("datetime64[ns]")
     dataset["_ridx"] = np.arange(len(dataset))               # explicit row id (merge_asof resets index)
 
     narr = narr_feats.copy()
     narr["symbol"] = narr["symbol"].map(_base_ticker)
     nts = pd.to_datetime(narr["ts"], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
-    narr["ts"] = nts
+    narr["ts"] = nts.astype("datetime64[ns]")
 
     pieces = []
     for tkr, left in dataset.groupby("_tkr", sort=False):
