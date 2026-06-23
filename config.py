@@ -141,6 +141,11 @@ class SentimentConfig:
     COINDESK_ARTICLE_DETAIL_OUTPUT_NAME = "coindesk_article_details.parquet"
     COINDESK_ARTICLE_BODY_OUTPUT_NAME = "coindesk_article_bodies.parquet"
 
+    CRYPTOSLATE_NEWS_BASE_URL = "https://cryptoslate.com/news"
+    CRYPTOSLATE_ARCHIVE_OUTPUT_NAME = "cryptoslate_archive_index.parquet"
+    CRYPTOSLATE_ARTICLE_DETAIL_OUTPUT_NAME = "cryptoslate_article_details.parquet"
+    CRYPTOSLATE_ARTICLE_BODY_OUTPUT_NAME = "cryptoslate_article_bodies.parquet"
+
 
 def init_directories():
     """初始化项目目录结构，应在程序启动时显式调用。"""
