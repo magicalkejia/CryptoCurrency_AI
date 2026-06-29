@@ -35,9 +35,13 @@ import pandas as pd
 # Coin Type (lower-cased) -> base ticker. Ripple and XRP both map to XRP. TRX has no rows
 # in the current dataset, so it simply never appears -> downstream fills it with 0 (neutral).
 COIN_TO_TICKER = {
+    # full names (legacy CryptoDataSet_v1.xlsx 'Coin Type')
     "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL",
     "ripple": "XRP", "xrp": "XRP", "dogecoin": "DOGE", "cardano": "ADA",
     "litecoin": "LTC", "chainlink": "LINK", "binance coin": "BNB", "tron": "TRX",
+    # base tickers (merged_news_for_llm 'asset_type' = ["BTC","ETH", ...])
+    "btc": "BTC", "eth": "ETH", "sol": "SOL", "bnb": "BNB", "doge": "DOGE",
+    "ltc": "LTC", "link": "LINK", "trx": "TRX", "ada": "ADA",
 }
 BAR = "4h"
 FEATURE_COLS = ["narr_sent_ewm", "narr_news_count_7d_log", "narr_sent_mom"]

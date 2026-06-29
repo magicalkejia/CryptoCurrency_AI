@@ -193,7 +193,8 @@ def build_market_dataset(symbols: List[str], fcfg, processed_dir=None, loader=No
                          patchtst_lookback: int = 96, patchtst_emb_dim: int = 8,
                          bars_provider: Optional[Callable[[str, str], Optional[pd.DataFrame]]] = None,
                          feature_set: str = DEFAULT_FEATURE_SET,
-                         feature_path=None, synthetic: bool = False
+                         feature_path=None, synthetic: bool = False,
+                         xs_features: bool = False
                          ) -> MarketDataset:
     """
     Build the full multi-symbol supervised dataset.
@@ -282,6 +283,16 @@ def build_market_dataset(symbols: List[str], fcfg, processed_dir=None, loader=No
 
     modality_cols = {"market": market_cols, "onchain": onchain_cols,
                      "narrative": [], "patchtst": patch_cols}
+
+    # ---- OPTIONAL: cross-sectional relative features (own modality 'xsmom') ----
+    # PIT-safe, zero new data: relative strength vs the cross-section / vs BTC.
+    if xs_features:
+        from etl.cross_sectional_features import add_cross_sectional_features
+        ds, xs_cols = add_cross_sectional_features(ds)
+        if xs_cols:
+            modality_cols["xsmom"] = xs_cols
+            feature_cols = feature_cols + xs_cols
+
     close_panel = pd.DataFrame({s: close_map[s] for s in close_map})
 
     # coverage diagnostics (so the on-chain impact is visible in the run header)

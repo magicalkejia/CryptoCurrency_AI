@@ -56,7 +56,10 @@ from crypto.governance.pbo import cscv_pbo
 from crypto.governance.holdout import dev_holdout_split, freeze_config, load_frozen
 from crypto.governance.registry import pre_register, assert_preregistered
 from crypto.skills.catalog import (get_feature_row, check_data_quality, detect_regime,
-                                   compute_confidence, risk_size_and_gate)
+                                   compute_confidence, risk_size_and_gate,
+                                   compute_circuit_breaker, portfolio_risk_overlay)
+from crypto.risk.portfolio import equity_risk_metrics
+from crypto.live.risk_guard import CircuitBreaker
 
 BARS_PER_YEAR_4H = 2190  # 365 * 6
 
@@ -188,11 +191,24 @@ def _pbo_over_grid(ds, tabular_cols, fcfg, n_blocks=12):
     return res
 
 
-def _latest_signals(ds, signals, fcfg, code_hash="experiment"):
-    """§1.4-style structured signal for the latest decision per symbol, reusing
-    the existing Skills (regime + confidence + risk sizing)."""
+def _latest_signals(ds, signals, fcfg, code_hash="experiment", close_panel=None,
+                    equity_returns=None, bars_per_year=BARS_PER_YEAR_4H):
+    """§1.4-style structured signal for the latest decision per symbol, reusing the
+    existing Skills (regime + confidence + risk sizing) PLUS the new B1 circuit
+    breaker and A2 portfolio overlay. Returns (rows, portfolio_report)."""
     merged = ds.merge(signals, on=["symbol", "decision_time"], how="left", suffixes=("", "_sig"))
-    out = []
+
+    # --- B1: circuit-breaker level from the deployable equity curve ---------- #
+    cb_level, cb_reason, dd = 0, "ok", 0.0
+    if equity_returns is not None and len(equity_returns) > 0:
+        dd, daily_loss, roll_abs = equity_risk_metrics(equity_returns, bars_per_day=6,
+                                                        rolling_dd_days=90)
+        out_cb = compute_circuit_breaker(CircuitBreaker(), drawdown=dd, daily_loss=daily_loss,
+                                         rolling_abs_daily_returns=roll_abs)
+        cb_level, cb_reason = out_cb["cb_level"], out_cb["cb_reason"]
+
+    # --- pass 1: per-symbol intents (risk sizing with the shared cb_level) --- #
+    rows, intents = [], {}
     for sym, g in merged.groupby("symbol"):
         g = g.dropna(subset=["combined_alpha"])
         if g.empty:
@@ -206,28 +222,56 @@ def _latest_signals(ds, signals, fcfg, code_hash="experiment"):
         dq = check_data_quality(feat_row, [c for c in ds.columns if c in feat_row])
         regime = detect_regime(feat_row)["regime"]
         conf = compute_confidence(feat_row, fusion_out, dq["data_quality_score"])["confidence"]
-        risk = risk_size_and_gate(fusion_out, conf, feat_row, fcfg, cb_level=0)
+        risk = risk_size_and_gate(fusion_out, conf, feat_row, fcfg, cb_level=cb_level)
+        rows.append({"sym": sym, "dt": dt, "fusion_out": fusion_out, "regime": regime,
+                     "conf": conf, "dq": dq, "risk": risk})
+        if risk["risk_approved"]:
+            intents[sym] = {"target_position": risk["target_position"],
+                            "direction": fusion_out["primary_direction"]}
+
+    # --- A2: cross-symbol portfolio overlay (PIT close panel up to last bar) - #
+    cp = None
+    if close_panel is not None and rows:
+        last_dt = max(r["dt"] for r in rows)
+        cp = close_panel.loc[close_panel.index <= last_dt]
+    adjusted, port_report = {}, {"note": "no_intents"}
+    if intents:
+        ov = portfolio_risk_overlay(intents, cp, fcfg, equity_drawdown=dd,
+                                    bars_per_year=bars_per_year)
+        adjusted, port_report = ov["adjusted_positions"], ov["portfolio_report"]
+    port_report["circuit_breaker_level"] = cb_level
+    port_report["circuit_breaker_reason"] = cb_reason
+
+    # --- pass 2: structured output with post-overlay positions --------------- #
+    out = []
+    for r in rows:
+        sym, dt, fusion_out, risk = r["sym"], r["dt"], r["fusion_out"], r["risk"]
+        pre = float(risk["target_position"])
+        final = float(adjusted.get(sym, pre if risk["risk_approved"] else 0.0))
+        approved = risk["risk_approved"] and abs(final) > 1e-9
         out.append({
             "decision_time": pd.Timestamp(dt).isoformat(),
             "symbol": sym.replace("/", ""),
-            "regime": regime,
+            "regime": r["regime"],
             "combined_alpha": round(fusion_out["combined_alpha"], 4),
             "primary_direction": fusion_out["primary_direction"],
             "meta_trade_prob_calibrated": (None if np.isnan(fusion_out["meta_trade_prob_calibrated"])
                                            else round(fusion_out["meta_trade_prob_calibrated"], 4)),
-            "confidence": round(conf, 4),
-            "action": fusion_out["primary_direction"] if risk["risk_approved"] else "flat",
-            "target_position": round(risk["target_position"], 4),
+            "confidence": round(r["conf"], 4),
+            "action": fusion_out["primary_direction"] if approved else "flat",
+            "target_position": round(final, 4),
+            "target_position_pre_portfolio": round(pre, 4),
             "vol_target_scalar": round(risk.get("vol_target_scalar", 0.0), 4),
             "stop_loss": round(risk["stop_loss"], 4),
             "take_profit": round(risk["take_profit"], 4),
             "barrier_source": "ATR20_1h_at_decision_time",
             "risk_level": risk["risk_level"],
-            "data_quality_score": round(dq["data_quality_score"], 4),
+            "circuit_breaker_level": cb_level,
+            "data_quality_score": round(r["dq"]["data_quality_score"], 4),
             "reason": risk["reason"],
             "audit_id": make_audit_id(sym, dt, "experiment_oof", "processed_parquet", code_hash, fcfg),
         })
-    return out
+    return out, port_report
 
 
 def _fmt(x, p="{:+.3f}"):
@@ -362,6 +406,82 @@ def _run_holdout(md, cut, fcfg, outdir, args):
                                 np.where(alpha < -fcfg.theta_short, "short", "flat")))
     dirdist = dirser.value_counts(normalize=True).round(4).to_dict()
 
+    # ------------------------------------------------------------------ #
+    #  FULL SAMPLE-OUT SUITE (same strategies + metrics as the dev study) #
+    #  Built on the holdout window only, frozen config, ONE model fit.    #
+    #  This is the confirmatory analog of the dev real-returns table so   #
+    #  the report can analyze Step5 / Step7 / +stacks out-of-sample with  #
+    #  the full metric set (return / risk / risk-adjusted / trading).     #
+    # ------------------------------------------------------------------ #
+    holdout_suite = {}
+    try:
+        from crypto.experiments.incremental_study import (
+            _alpha_to_weight_panel, _tsmom_weight_panel, _risk_sleeve_combine, _panel_to_returns)
+        from crypto.eval.decision_backtest import (
+            run_decision_backtest, run_directional_decision_backtest)
+        from backtest.metrics import calc_full_metrics
+
+        # alpha panel on the holdout (the cross-sectional ML signal = Step5 core)
+        hsig = hold[["symbol", "decision_time"]].copy()
+        hsig["combined_alpha"] = alpha
+        hsig["primary_direction"] = dirser.values
+        hsig["meta_trade_prob_calibrated"] = np.nan
+
+        def _full(rseries, turn=None, cost=None):
+            r = pd.Series(rseries).dropna()
+            m = calc_full_metrics(r, turnover=turn, cost=cost, annual_days=BARS_PER_YEAR_4H)
+            eq = (1.0 + r).cumprod()
+            return {"ann_return": m.get("strategy_annual_return"),
+                    "cum_return": float(eq.iloc[-1] - 1.0) if len(eq) else float("nan"),
+                    "ann_vol": m.get("strategy_volatility"),
+                    "max_drawdown": abs(m.get("strategy_max_drawdown")) if m.get("strategy_max_drawdown") is not None else None,
+                    "sharpe": m.get("strategy_sharpe"), "sortino": m.get("strategy_sortino"),
+                    "calmar": m.get("strategy_calmar"), "win_rate": m.get("win_rate"),
+                    "profit_loss_ratio": m.get("profit_loss_ratio"),
+                    "ann_turnover": m.get("annual_turnover"),
+                    "ann_cost_pct": (m.get("avg_daily_cost") * BARS_PER_YEAR_4H * 100
+                                     if m.get("avg_daily_cost") is not None else None)}
+
+        # Step5: cross-sectional neutral book from the ML alpha
+        w5 = _alpha_to_weight_panel(hold, alpha, cp, fcfg, BARS_PER_YEAR_4H,
+                                    smooth_bars=args.smooth_bars, deadband=args.deadband,
+                                    meta_prob=None, deploy_mode="xs_neutral",
+                                    max_vol_scale=fcfg.risk.max_vol_scalar,
+                                    no_trade_band=args.no_trade_band, allow_flat=True)
+        r5, t5, c5 = _panel_to_returns(cp, w5, BARS_PER_YEAR_4H, fcfg)
+        holdout_suite["Step5_fusion (pure signal)"] = _full(r5)
+
+        # Step7: Step5 neutral sleeve + TSMOM sleeve, equal-risk combine
+        w7 = _risk_sleeve_combine(cp, w5, tw, BARS_PER_YEAR_4H, fcfg)
+        r7, t7, c7 = _panel_to_returns(cp, w7, BARS_PER_YEAR_4H, fcfg)
+        holdout_suite["Step7_tsmom_fusion (MAIN deliverable)"] = _full(r7)
+
+        # Step5 + NEUTRAL decision stack
+        dz = run_decision_backtest(hold, hsig, cp, fcfg, bars_per_year=BARS_PER_YEAR_4H,
+                                   apply_overlay=True, apply_circuit_breaker=True,
+                                   sizing_mode="xs_neutral", smooth_bars=args.smooth_bars,
+                                   deadband=args.deadband, cb_dd_l1=args.cb_dd_start,
+                                   cb_dd_l2=args.cb_dd_l2, cb_dd_l3=args.cb_dd_stop,
+                                   strategy_name="holdout_decision_stack")
+        holdout_suite["Step5 + neutral decision stack"] = _full(
+            dz["raw"]["returns"], dz["raw"].get("turnover"), dz["raw"].get("cost"))
+
+        # Step7 + DIRECTIONAL decision stack
+        dd = run_directional_decision_backtest(w7, cp, fcfg, bars_per_year=BARS_PER_YEAR_4H,
+                                               net_exposure_cap=1.5, apply_circuit_breaker=True,
+                                               cb_dd_l1=args.cb_dd_start, cb_dd_l2=args.cb_dd_l2,
+                                               cb_dd_l3=args.cb_dd_stop,
+                                               strategy_name="holdout_directional_stack")
+        holdout_suite["Step7 + directional stack (full risk)"] = _full(
+            dd["raw"]["returns"], dd["raw"].get("turnover"), dd["raw"].get("cost"))
+        holdout_suite["_directional_info"] = dd["info"]
+
+        # TSMOM benchmark
+        holdout_suite["Step0_TSMOM (benchmark)"] = _full(tret)
+    except Exception as e:
+        print(f"    [holdout suite] full-suite build failed ({e}); core verdict still valid")
+        import traceback; traceback.print_exc()
+
     print("\n" + "!" * 74)
     print(" HOLDOUT-A FINAL TEST (consumes the holdout; run ONCE)")
     print("!" * 74)
@@ -376,13 +496,45 @@ def _run_holdout(md, cut, fcfg, outdir, args):
                else "model does NOT beat TSMOM on holdout")
     print(f"    VERDICT        : {verdict}")
 
+    # ---- full sample-out strategy table (return / risk / risk-adjusted / trading) ----
+    suite = {k: v for k, v in holdout_suite.items() if not k.startswith("_")}
+    if suite:
+        print("\n    HOLDOUT REAL RETURNS (sample-out)  [年化 / 累计 / 波动 / 回撤 / Sharpe / Sortino / Calmar / 换手 / 胜率]")
+        print("    " + "-" * 110)
+        print(f"    {'strategy':<42}{'AnnRet':>8}{'CumRet':>9}{'Vol':>8}{'MaxDD':>8}{'Sharpe':>8}{'Sortino':>9}{'Calmar':>8}{'Turn':>7}{'Win':>7}")
+        print("    " + "-" * 110)
+        def _p(x, pct=False, dec=2):
+            if x is None or (isinstance(x, float) and not np.isfinite(x)): return "   nan"
+            return f"{x*100:.1f}%" if pct else f"{x:.{dec}f}"
+        for nm, s in suite.items():
+            print(f"    {nm:<42}{_p(s['ann_return'],1):>8}{_p(s['cum_return'],1):>9}"
+                  f"{_p(s['ann_vol'],1):>8}{_p(s['max_drawdown'],1):>8}{_p(s['sharpe']):>8}"
+                  f"{_p(s['sortino']):>9}{_p(s['calmar']):>8}{_p(s['ann_turnover'],0,0):>7}{_p(s['win_rate'],1):>7}")
+        print("    " + "-" * 110)
+        (outdir / "holdout_real_returns_table.json").write_text(
+            json.dumps(holdout_suite, indent=2, default=str), encoding="utf-8")
+        # flat CSV
+        import csv as _csv
+        with open(outdir / "holdout_real_returns_table.csv", "w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f)
+            w.writerow(["strategy", "ann_return", "cum_return", "ann_vol", "max_drawdown",
+                        "sharpe", "sortino", "calmar", "win_rate", "profit_loss_ratio",
+                        "ann_turnover", "ann_cost_pct"])
+            for nm, s in suite.items():
+                w.writerow([nm, s["ann_return"], s["cum_return"], s["ann_vol"], s["max_drawdown"],
+                            s["sharpe"], s["sortino"], s["calmar"], s["win_rate"],
+                            s["profit_loss_ratio"], s["ann_turnover"], s["ann_cost_pct"]])
+        print(f"    -> holdout_real_returns_table.csv / .json")
+
     # live §1.4 signal for the latest bar (train on dev, predict latest)
     sigdf = hold[["symbol", "decision_time"]].copy()
     sigdf["combined_alpha"] = alpha
     sigdf["primary_direction"] = dirser.values
     sigdf["meta_trade_prob_calibrated"] = np.nan
-    latest = _latest_signals(hold, sigdf, fcfg, code_hash="holdout_final")
+    latest, port = _latest_signals(hold, sigdf, fcfg, code_hash="holdout_final",
+                                   close_panel=cp, equity_returns=ret)
     (outdir / "signals_latest.json").write_text(json.dumps(latest, indent=2, ensure_ascii=False))
+    (outdir / "portfolio_risk.json").write_text(json.dumps(port, indent=2, ensure_ascii=False, default=str))
 
     rep = [f"# HOLDOUT-A FINAL TEST — {datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}\n",
            "> Consumes Holdout-A. Per v6 §6.4 this is the once-only confirmatory grade.\n",
@@ -392,6 +544,23 @@ def _run_holdout(md, cut, fcfg, outdir, args):
            f"- TSMOM baseline Sharpe: {_fmt(tsh)}",
            f"- direction distribution: {dirdist}",
            f"- **VERDICT: {verdict}**"]
+    if suite:
+        rep.append("\n## Sample-out strategy table (frozen config, same metrics as dev)\n")
+        rep.append("| strategy | AnnRet | CumRet | Vol | MaxDD | Sharpe | Sortino | Calmar | Turn/yr | Win |")
+        rep.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
+        def _m(x, pct=False, dec=2):
+            if x is None or (isinstance(x, float) and not np.isfinite(x)): return "—"
+            return f"{x*100:.1f}%" if pct else f"{x:.{dec}f}"
+        for nm, s in suite.items():
+            rep.append(f"| {nm} | {_m(s['ann_return'],1)} | {_m(s['cum_return'],1)} | "
+                       f"{_m(s['ann_vol'],1)} | {_m(s['max_drawdown'],1)} | {_m(s['sharpe'])} | "
+                       f"{_m(s['sortino'])} | {_m(s['calmar'])} | {_m(s['ann_turnover'],False,0)} | "
+                       f"{_m(s['win_rate'],1)} |")
+        di = holdout_suite.get("_directional_info", {})
+        if di:
+            rep.append(f"\n- Step7 directional stack: avg|net|={di.get('avg_abs_net_exposure'):.2f} "
+                       f"(cap {di.get('net_exposure_cap')}), target vol {di.get('target_portfolio_vol')}, "
+                       f"CB-active {di.get('cb_active_frac',0)*100:.1f}%")
     (outdir / "HOLDOUT_report.md").write_text("\n".join(rep), encoding="utf-8")
     print(f"\n    HOLDOUT_report.md + signals_latest.json -> {outdir}")
 
@@ -408,8 +577,10 @@ def main():
     ap.add_argument("--feature_set", default=DEFAULT_FEATURE_SET,
                     help="registry model feature set (market_core_v1 | market_plus_funding_v1 | "
                          "market_plus_onchain_v1 | market_plus_funding_onchain_v1)")
-    ap.add_argument("--smooth_bars", type=int, default=6,
-                    help="EMA span for position smoothing (low turnover). ~1 day at 4h.")
+    ap.add_argument("--smooth_bars", type=int, default=24,
+                    help="EMA span for position smoothing (low turnover). Default 24 (~4 days "
+                         "at 4h): chosen to control transaction costs on this low-frequency book, "
+                         "not to fit dev Sharpe. Use 6 for a more responsive (higher-cost) variant.")
     ap.add_argument("--deadband", type=float, default=0.05,
                     help="ignore |alpha| below this (no trade on weak signal)")
     ap.add_argument("--deploy_mode", choices=["vol_parity", "simple", "xs_neutral"], default="vol_parity",
@@ -420,8 +591,8 @@ def main():
     ap.add_argument("--max_vol_scale", type=float, default=3.0,
                     help="cap on low-vol leverage of the vol-parity engine (lower -> less turnover; "
                          "1.0 = no leverage)")
-    ap.add_argument("--no_trade_band", type=float, default=0.0,
-                    help="final-weight hysteresis band (e.g. 0.05): only rebalance a symbol when its "
+    ap.add_argument("--no_trade_band", type=float, default=0.05,
+                    help="final-weight hysteresis band (default 0.05): only rebalance a symbol when its "
                          "target weight moves more than this (turnover control)")
     ap.add_argument("--no_pbo_grid", action="store_true",
                     help="skip the wider-grid PBO in [5d] (faster; the 4-config ablation PBO in [5] "
@@ -435,9 +606,33 @@ def main():
                          "If given, the narrative modality is asof-merged in (PIT-safe) and Step3 / "
                          "Step5 fusion will use it. Build it with etl.score_news + "
                          "etl.build_narrative_features.")
+    ap.add_argument("--event_parquet", default="data_storage/factors/sentiment/event_features.parquet",
+                    help="path to event_features.parquet (per-symbol LLM event/narrative "
+                         "factors). Loaded BY DEFAULT if it exists (PIT asof-merge, registered "
+                         "as the 'event' modality -> Step3b_+event). Build it with "
+                         "etl.extract_events_llm + etl.build_event_features. Skipped silently if "
+                         "the file is absent, or disable explicitly with --no_event.")
+    ap.add_argument("--no_event", action="store_true",
+                    help="disable the event modality even if event_features.parquet exists.")
+    ap.add_argument("--decision_backtest", action="store_true",
+                    help="also backtest the FULL agent decision stack (per-symbol risk "
+                         "sizing + portfolio overlay + circuit breaker) through backtest/ "
+                         "engine, via crypto.eval.decision_backtest. Saves decision_stack_*.json.")
+    ap.add_argument("--xs_features", action="store_true",
+                    help="add PIT-safe cross-sectional relative features (relative strength vs the "
+                         "cross-section / vs BTC) as a new 'xsmom' modality + a Step1b_+xsmom ladder "
+                         "step. Zero new data; most relevant for --deploy_mode xs_neutral.")
+    ap.add_argument("--decision_use_meta_gate", action="store_true",
+                    help="in the decision-stack backtest, gate positions on the meta probability "
+                         "(meta_prob>p_threshold). Default OFF: the ladder's Step6 shows the meta "
+                         "gate hurts this book, so the stack sizes by signal conviction instead.")
     ap.add_argument("--narrative_buffer_min", type=int, default=0,
                     help="extra PIT safety buffer in minutes for the narrative asof-merge "
                          "(default 0; the 4h binning already guarantees strictly-before-decision news)")
+    ap.add_argument("--tsmom_lookbacks", type=int, nargs="+", default=None,
+                    help="multi-scale TSMOM lookbacks in BARS (e.g. 180 540 1080 = 1/3/6 months "
+                         "at 4h, per Moskowitz-Ooi-Pedersen 2012). Default None = single-scale "
+                         "90-bar baseline. Affects Step0 (TSMOM benchmark) and Step7 (ML+TSMOM).")
     ap.add_argument("--p_threshold", type=float, default=None,
                     help="override meta-gate probability threshold (default 0.55 from RiskConfig); "
                          "changes config_hash")
@@ -456,6 +651,14 @@ def main():
     ap.add_argument("--sl_mult", type=float, default=None, help="override stop-loss barrier (ATR mult)")
     ap.add_argument("--run_holdout", action="store_true",
                     help="FINAL TEST: train on dev, evaluate the frozen holdout ONCE (consumes Holdout-A)")
+    ap.add_argument("--cb_dd_start", type=float, default=None,
+                    help="circuit-breaker L1 drawdown trip point (default 0.10); also moves the "
+                         "smooth dd-scaler start. Loosen (e.g. 0.25) for risk-sensitivity analysis.")
+    ap.add_argument("--cb_dd_l2", type=float, default=None,
+                    help="circuit-breaker L2 drawdown trip point (default 0.15).")
+    ap.add_argument("--cb_dd_stop", type=float, default=None,
+                    help="circuit-breaker L3 drawdown trip point (default 0.20); also moves the "
+                         "smooth dd-scaler stop. Loosen (e.g. 0.45 ~= 2x annual vol) for sensitivity.")
     args = ap.parse_args()
 
     fcfg = FrozenConfig()
@@ -483,6 +686,7 @@ def main():
     print(f" feature_set={args.feature_set}")
     print(f" deploy_mode={args.deploy_mode} max_vol_scale={args.max_vol_scale} "
           f"no_trade_band={args.no_trade_band} p_threshold={fcfg.risk.p_threshold}")
+    print(f" tsmom={'multiscale ' + str(args.tsmom_lookbacks) if args.tsmom_lookbacks else 'single-scale 90-bar'}")
     print(f" label barriers: tp={fcfg.label.tp_mult} sl={fcfg.label.sl_mult}"
           f"{'  [SYMMETRIC]' if fcfg.label.tp_mult == fcfg.label.sl_mult else ''}")
     print(f" mode={'SYNTHETIC (wiring check)' if args.synthetic else 'REAL parquet'}"
@@ -500,7 +704,7 @@ def main():
 
     md = build_market_dataset(args.symbols, fcfg, patchtst_emb_dim=args.patchtst_emb_dim,
                               bars_provider=provider, feature_set=args.feature_set,
-                              synthetic=args.synthetic)
+                              synthetic=args.synthetic, xs_features=args.xs_features)
     print("\n[1] DATASET")
     for s, info in md.per_symbol.items():
         if s.startswith("_"):
@@ -529,6 +733,27 @@ def main():
         print("    narrative coverage (fraction of decisions with any news, by symbol): "
               + ", ".join(f"{s.split('/')[0]}={v:.2f}" for s, v in cov.items()))
 
+    # --- LLM event modality (A1): asof-merge per-symbol structured event factors ---
+    # --- LLM event modality (A1): on by default; skipped if file missing/synthetic/--no_event ---
+    _ev_path = Path(args.event_parquet) if args.event_parquet else None
+    if args.no_event or args.synthetic:
+        if args.no_event:
+            print("    event modality: disabled via --no_event")
+    elif _ev_path is None or not _ev_path.exists():
+        print(f"    event modality: skipped (no file at {args.event_parquet}; "
+              f"build it with etl.extract_events_llm + etl.build_event_features)")
+    else:
+        from etl.narrative_loader import load_event_features, attach_event_features
+        from etl.build_event_features import EVENT_FEATURE_COLS
+        ev = load_event_features(str(_ev_path))
+        attach_event_features(md.dataset, md.modality_cols, ev, buffer_min=args.narrative_buffer_min)
+        evcov = (md.dataset.assign(_h=(md.dataset[EVENT_FEATURE_COLS].abs().sum(axis=1) > 0))
+                 .groupby("symbol")["_h"].mean())
+        print(f"    event modality: loaded {_ev_path}  cols={EVENT_FEATURE_COLS}  "
+              f"(PIT asof, buffer={args.narrative_buffer_min}min)")
+        print("    event coverage (fraction of decisions with any event signal, by symbol): "
+              + ", ".join(f"{s.split('/')[0]}={v:.2f}" for s, v in evcov.items()))
+
     print("\n[2] PIT LEAKAGE AUDIT")
     print(f"    future_function_checks_passed = {md.audit['future_function_checks_passed']}  "
           f"(violations={md.audit['availability_lag_violations']}, rows={md.audit['n_rows']})")
@@ -552,7 +777,8 @@ def main():
     ladder = run_incremental_study(dev, dev_close, md.modality_cols, fcfg, bars_per_year=BARS_PER_YEAR_4H,
                                    smooth_bars=args.smooth_bars, deadband=args.deadband,
                                    deploy_mode=args.deploy_mode, max_vol_scale=args.max_vol_scale,
-                                   no_trade_band=args.no_trade_band, allow_flat=args.xs_allow_flat)
+                                   no_trade_band=args.no_trade_band, allow_flat=args.xs_allow_flat,
+                                   tsmom_lookbacks=args.tsmom_lookbacks)
     pd.set_option("display.width", 180, "display.max_columns", 20)
     print(ladder.round(4).to_string())
     ladder.to_csv(outdir / "incremental_ladder.csv")
@@ -575,6 +801,7 @@ def main():
     print("\n[5b] PER-YEAR SHARPE STABILITY  [dev only]  (consistent positive years = "
           "regime-robust; a borderline PBO over near-tied A/B/C/D is then a ranking artifact)")
     rbs = ladder.attrs.get("returns_by_step", {})
+    wps = ladder.attrs.get("weight_panels", {})       # signed panels (Step7) for directional stack
     key_steps = [s for s in ("Step0_baseline_tsmom", "Step1_market", "Step5_fusion",
                              "Step7_tsmom_fusion", "Step8_onchain_overlay") if s in rbs]
     if not key_steps:
@@ -625,10 +852,186 @@ def main():
         print(f"    {k}: {v}")
     signals.to_csv(outdir / "signals_oof.csv", index=False)
 
-    # ---- 6. §1.4 latest structured signals (end of dev) ----
-    latest = _latest_signals(dev, signals, fcfg)
+    # ---- 6. §1.4 latest structured signals (end of dev) + portfolio overlay ----
+    eq_ret = rbs.get("Step5_fusion", rbs.get("Step1_market"))   # deployable dev equity curve
+    latest, port = _latest_signals(dev, signals, fcfg, close_panel=dev_close, equity_returns=eq_ret)
     (outdir / "signals_latest.json").write_text(json.dumps(latest, indent=2, ensure_ascii=False))
+    (outdir / "portfolio_risk.json").write_text(json.dumps(port, indent=2, ensure_ascii=False, default=str))
     print(f"    latest structured signals -> signals_latest.json ({len(latest)} symbols)")
+    print(f"    portfolio overlay: gross {port.get('gross_before')} -> {port.get('gross_after')}  "
+          f"cb_level={port.get('circuit_breaker_level')} ({port.get('circuit_breaker_reason')})  "
+          f"steps={port.get('steps')}")
+
+    # ---- 6b. OPTIONAL: backtest the FULL decision stack through backtest/ engine ----
+    if args.decision_backtest:
+        from crypto.eval.decision_backtest import run_decision_backtest
+        _sizing = "xs_neutral" if args.deploy_mode == "xs_neutral" else "per_symbol"
+        _cbmsg = ""
+        if any(v is not None for v in (args.cb_dd_start, args.cb_dd_l2, args.cb_dd_stop)):
+            _cbmsg = (f" cb_dd=L1:{args.cb_dd_start or 0.10:.0%}/"
+                      f"L2:{args.cb_dd_l2 or 0.15:.0%}/L3:{args.cb_dd_stop or 0.20:.0%}")
+        print(f"    [decision-stack backtest] running full risk+portfolio+CB stack "
+              f"(sizing={_sizing}, meta_gate={'ON' if args.decision_use_meta_gate else 'OFF'}{_cbmsg}) through backtest engine ...")
+        dbt = run_decision_backtest(dev, signals, dev_close, fcfg, bars_per_year=BARS_PER_YEAR_4H,
+                                    apply_overlay=True, apply_circuit_breaker=True,
+                                    use_meta_gate=args.decision_use_meta_gate, sizing_mode=_sizing,
+                                    smooth_bars=args.smooth_bars, deadband=args.deadband,
+                                    cb_dd_l1=args.cb_dd_start, cb_dd_l2=args.cb_dd_l2,
+                                    cb_dd_l3=args.cb_dd_stop,
+                                    strategy_name="decision_stack")
+        m = dbt["metrics"]
+        summary = {"info": dbt["info"],
+                   "sharpe": m.get("strategy_sharpe"), "annual_return": m.get("strategy_annual_return"),
+                   "volatility": m.get("strategy_volatility"), "max_drawdown": m.get("strategy_max_drawdown"),
+                   "avg_turnover": m.get("avg_turnover"), "total_cost": m.get("total_cost")}
+        (outdir / "decision_stack_metrics.json").write_text(json.dumps(m, indent=2, default=str))
+        dbt["raw"]["returns"].to_frame("returns").to_csv(outdir / "decision_stack_returns.csv")
+        def _f(x, scale=1.0, suffix=""):
+            return "n/a" if x is None else f"{scale*x:.2f}{suffix}"
+        print(f"      decision-stack: Sharpe={_f(summary['sharpe'])}  "
+              f"AnnRet={_f(summary['annual_return'], 100, '%')}  "
+              f"MaxDD={_f(summary['max_drawdown'], 100, '%')}  "
+              f"CB-active={dbt['info'].get('cb_active_frac', 0):.2%}  -> decision_stack_metrics.json")
+        if summary["sharpe"] is None:
+            print("      [note] decision-stack held ~no position over the backtest (likely the "
+                  "circuit breaker tripped on the dev-period equity, or all intents were gated). "
+                  "Metrics are n/a; see decision_stack_metrics.json / the ladder table instead.")
+        fn = dbt["info"].get("funnel", {})
+        if fn:
+            print(f"      [decision-stack funnel] of {fn.get('rows',0)} (symbol,bar) intents over "
+                  f"{fn.get('timestamps_total',0)} bars:")
+            print(f"        flat/no-meta rejected : {fn.get('flat_or_no_meta',0)}")
+            print(f"        meta-gate rejected    : {fn.get('meta_gated',0)}  (use_meta_gate={args.decision_use_meta_gate})")
+            print(f"        zero-size/blocked     : {fn.get('zero_size',0)}  (e.g. vol_target_scalar=0)")
+            print(f"        -> approved intents   : {fn.get('approved_intents',0)}")
+            print(f"        bars with >=1 intent  : {fn.get('timestamps_with_intent',0)} / {fn.get('timestamps_total',0)}")
+            print(f"        bars zeroed by overlay: {fn.get('overlay_zeroed_ts',0)}")
+
+        # decision stack (risk+portfolio+CB) vs pure-signal ladder steps -> defense table.
+        # Also run a CB-OFF variant (risk sizing + portfolio overlay only): isolates what
+        # the risk/portfolio machinery does to the signal, separate from the circuit
+        # breaker (which can halt trading entirely on a losing dev period).
+        from crypto.eval.decision_backtest import compare_decision_vs_signal, format_comparison_table
+        dbt_nocb = run_decision_backtest(dev, signals, dev_close, fcfg, bars_per_year=BARS_PER_YEAR_4H,
+                                         apply_overlay=True, apply_circuit_breaker=False,
+                                         use_meta_gate=args.decision_use_meta_gate, sizing_mode=_sizing,
+                                         smooth_bars=args.smooth_bars, deadband=args.deadband,
+                                    cb_dd_l1=args.cb_dd_start, cb_dd_l2=args.cb_dd_l2,
+                                         cb_dd_l3=args.cb_dd_stop,
+                                         strategy_name="decision_stack_noCB")
+        sig = {"decision_stack_noCB (risk+port)": dbt_nocb["raw"]["returns"],
+               "Step5_fusion (pure signal)": rbs.get("Step5_fusion"),
+               "Step6_meta_gate (signal+gate)": rbs.get("Step6_meta_gate"),
+               "Step0_TSMOM (benchmark)": rbs.get("Step0_baseline_tsmom")}
+        cmp = compare_decision_vs_signal(dbt["raw"]["returns"], sig, bars_per_year=BARS_PER_YEAR_4H)
+        (outdir / "decision_vs_signal.json").write_text(json.dumps(cmp, indent=2, default=str))
+        print(format_comparison_table(cmp))
+
+        # ---- DIRECTIONAL decision stack on the MAIN deliverable Step7 ----------------
+        # Step5 is a neutral book -> neutral overlay (above). Step7 (ML+TSMOM) is a
+        # DIRECTIONAL book -> the directional risk paradigm (net-exposure cap + total
+        # vol target + circuit breaker), NOT the neutral overlay (which would neutralize
+        # TSMOM's net-direction alpha). This demonstrates "two paradigms x matched risk".
+        dir_summary = None
+        _w7 = wps.get("Step7_tsmom_fusion")
+        if _w7 is not None and len(_w7):
+            from crypto.eval.decision_backtest import run_directional_decision_backtest
+            print("    [directional decision-stack] Step7 (ML+TSMOM) through the DIRECTIONAL "
+                  "risk paradigm (net-exposure cap + total vol target + CB) ...")
+            ddir = run_directional_decision_backtest(
+                _w7, dev_close, fcfg, bars_per_year=BARS_PER_YEAR_4H, net_exposure_cap=1.5,
+                apply_circuit_breaker=True, cb_dd_l1=args.cb_dd_start, cb_dd_l2=args.cb_dd_l2,
+                cb_dd_l3=args.cb_dd_stop, strategy_name="directional_stack_step7")
+            dm = ddir["metrics"]; di = ddir["info"]
+            print(f"      directional-stack(Step7): Sharpe={dm['strategy_sharpe']:.2f}  "
+                  f"AnnRet={dm['strategy_annual_return']*100:.2f}%  MaxDD={dm['strategy_max_drawdown']*100:.2f}%  "
+                  f"avg|net|={di['avg_abs_net_exposure']:.2f} (cap {di['net_exposure_cap']})  "
+                  f"CB-active={di.get('cb_active_frac',0)*100:.2f}%")
+            dir_summary = {"info": di, "sharpe": dm["strategy_sharpe"],
+                           "annual_return": dm["strategy_annual_return"],
+                           "max_drawdown": dm["strategy_max_drawdown"]}
+            (outdir / "directional_stack_step7.json").write_text(
+                json.dumps({"metrics": {k: dm.get(k) for k in
+                            ("strategy_sharpe", "strategy_annual_return", "strategy_total_return",
+                             "strategy_max_drawdown", "strategy_volatility", "strategy_calmar")},
+                            "info": di}, indent=2, default=str))
+
+
+        # ---- REAL RETURNS TABLE: annual / cumulative / MaxDD / Sharpe, side by side ----
+        # More intuitive than Sharpe alone -- shows whether the book actually compounds.
+        # Computed uniformly from each strategy's own return series (same engine), so the
+        # columns are directly comparable. Step7 added explicitly as the MAIN deliverable.
+        def _ret_stats(r):
+            r = pd.Series(r).dropna()
+            if len(r) < 5:
+                return None
+            ann = float(r.mean() * BARS_PER_YEAR_4H)
+            cum = float((1.0 + r).prod() - 1.0)
+            eq = (1.0 + r).cumprod()
+            mdd = float((1.0 - eq / eq.cummax()).max())
+            sd = float(r.std())
+            shp = float(r.mean() / sd * np.sqrt(BARS_PER_YEAR_4H)) if sd > 1e-12 else float("nan")
+            return {"ann_return": ann, "cum_return": cum, "max_drawdown": mdd, "sharpe": shp}
+        real_rows = {}
+        real_rows["decision_stack (risk+port+CB)"] = _ret_stats(dbt["raw"]["returns"])
+        real_rows["decision_stack_noCB (risk+port)"] = _ret_stats(dbt_nocb["raw"]["returns"])
+
+        # MAIN-DELIVERABLE Step7 PUT THROUGH THE RISK CONTROL: Step7 is a directional
+        # ML+TSMOM book, so it can't ride the xs_neutral cross-sectional sizing. But the
+        # circuit-breaker is a return-series-level drawdown overlay, so we CAN apply it to
+        # the Step7 equity curve to show "what risk control does to the main deliverable":
+        # delever by the same CB drawdown scaler whenever Step7's rolling drawdown is deep.
+        def _apply_cb_to_returns(r, cb_l1, cb_l2, cb_l3):
+            r = pd.Series(r).dropna()
+            if len(r) < 10:
+                return None
+            from crypto.live.risk_guard import CircuitBreaker, CBLevel
+            from crypto.eval.decision_backtest import CB_POS_MULT, _dd_scaler
+            cbk = {}
+            if cb_l1 is not None: cbk["dd_l1"] = cb_l1
+            if cb_l2 is not None: cbk["dd_l2"] = cb_l2
+            if cb_l3 is not None: cbk["dd_l3"] = cb_l3
+            cb = CircuitBreaker(**cbk)
+            eq = (1.0 + r).cumprod()
+            win = max(2, int(90 * 6))                     # rolling 90-day peak
+            dd = (1.0 - eq / eq.rolling(win, min_periods=1).max())
+            daily = (1.0 + r).rolling(6).apply(np.prod, raw=True) - 1.0
+            dl = (-daily).clip(lower=0.0).fillna(0.0)
+            mult = pd.Series(1.0, index=r.index)
+            for t in r.index:
+                lvl = int(cb.evaluate(drawdown=float(dd.loc[t]), daily_loss=float(dl.loc[t])))
+                mult.loc[t] = CB_POS_MULT.get(lvl, 1.0) * _dd_scaler(float(dd.loc[t]), fcfg.risk)
+            # decision at t-1 governs exposure earning r[t]
+            return (r * mult.shift(1).fillna(1.0))
+        _r7 = rbs.get("Step7_tsmom_fusion")
+        if _r7 is not None:
+            real_rows["Step7_tsmom_fusion (MAIN deliverable)"] = _ret_stats(_r7)
+            _r7cb = _apply_cb_to_returns(_r7, args.cb_dd_start, args.cb_dd_l2, args.cb_dd_stop)
+            if _r7cb is not None:
+                real_rows["Step7 + circuit-breaker (deliverable+risk)"] = _ret_stats(_r7cb)
+        if dir_summary is not None:
+            real_rows["Step7 + directional stack (full risk)"] = _ret_stats(ddir["raw"]["returns"])
+        for _nm, _key in [("Step5_fusion (pure signal)", "Step5_fusion"),
+                          ("Step0_TSMOM (benchmark)", "Step0_baseline_tsmom")]:
+            _r = rbs.get(_key)
+            if _r is not None:
+                real_rows[_nm] = _ret_stats(_r)
+        real_rows = {k: v for k, v in real_rows.items() if v is not None}
+        if real_rows:
+            import pandas as _pd
+            rr = _pd.DataFrame(real_rows).T[["ann_return", "cum_return", "max_drawdown", "sharpe"]]
+            rr.to_csv(outdir / "real_returns_table.csv")
+            (outdir / "real_returns_table.json").write_text(
+                json.dumps({k: v for k, v in real_rows.items()}, indent=2, default=str))
+            print("\n    REAL RETURNS (dev period)  [年化收益 / 累计收益 / 最大回撤 / Sharpe]")
+            print("    " + "-" * 78)
+            print(f"    {'strategy':<38}{'AnnRet':>9}{'CumRet':>10}{'MaxDD':>9}{'Sharpe':>9}")
+            print("    " + "-" * 78)
+            for nm, st in real_rows.items():
+                print(f"    {nm:<38}{st['ann_return']*100:>8.1f}%{st['cum_return']*100:>9.1f}%"
+                      f"{st['max_drawdown']*100:>8.1f}%{st['sharpe']:>9.2f}")
+            print("    " + "-" * 78)
+            print("    -> real_returns_table.csv / .json")
 
     # ---- 7. governance: freeze + pre-register (do NOT run holdout) ----
     print("\n[7] GOVERNANCE (freeze + pre-register; Holdout-A NOT run here)")

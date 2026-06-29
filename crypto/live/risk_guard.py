@@ -38,10 +38,17 @@ class CircuitBreakerState:
 
 
 class CircuitBreaker:
-    def __init__(self, recover_periods: int = 5, reduced_pos_mult: float = 0.5):
+    def __init__(self, recover_periods: int = 5, reduced_pos_mult: float = 0.5,
+                 dd_l1: float = 0.10, dd_l2: float = 0.15, dd_l3: float = 0.20):
         self.state = CircuitBreakerState()
         self.recover_periods = recover_periods   # N=5 (~20h) default, simp #2
         self.reduced_pos_mult = reduced_pos_mult
+        # drawdown trip points for L1/L2/L3 (configurable for risk-sensitivity analysis;
+        # crypto assets run 60%+ annual vol, so a 20% drawdown is normal -> defaults can
+        # over-trip; loosening to ~2x annual vol is a defensible, pre-registered choice).
+        self.dd_l1 = float(dd_l1)
+        self.dd_l2 = float(dd_l2)
+        self.dd_l3 = float(dd_l3)
 
     @staticmethod
     def soft_daily_loss_threshold(rolling_abs_daily_returns: pd.Series) -> float:
@@ -59,16 +66,17 @@ class CircuitBreaker:
         hard = 3.0 * soft
 
         level = CBLevel.NORMAL
-        if (daily_loss > soft) or (drawdown > 0.10):
+        if (daily_loss > soft) or (drawdown > self.dd_l1):
             level = max(level, CBLevel.L1_WARN)
-        if (daily_loss > 2 * soft) or (drawdown > 0.15) or (not reconciliation_ok):
+        if (daily_loss > 2 * soft) or (drawdown > self.dd_l2) or (not reconciliation_ok):
             level = max(level, CBLevel.L2_DELEVER)
-        if (daily_loss > hard) or (drawdown > 0.20) or (not connection_ok) or kill_switch:
+        if (daily_loss > hard) or (drawdown > self.dd_l3) or (not connection_ok) or kill_switch:
             level = max(level, CBLevel.L3_HALT)
 
         self.state.level = CBLevel(level)
         self.state.reason = self._reason(drawdown, daily_loss, soft, hard,
-                                         connection_ok, reconciliation_ok, kill_switch)
+                                         connection_ok, reconciliation_ok, kill_switch,
+                                         self.dd_l1, self.dd_l2, self.dd_l3)
         return self.state.level
 
     def position_multiplier(self) -> float:
@@ -101,7 +109,8 @@ class CircuitBreaker:
                 self.state.reduced_risk_mode = False
 
     @staticmethod
-    def _reason(dd, dl, soft, hard, conn, recon, kill):
+    def _reason(dd, dl, soft, hard, conn, recon, kill,
+                dd_l1: float = 0.10, dd_l2: float = 0.15, dd_l3: float = 0.20):
         parts = []
         if not conn:
             parts.append("connection_anomaly")
@@ -109,12 +118,12 @@ class CircuitBreaker:
             parts.append("reconciliation_drift")
         if kill:
             parts.append("kill_switch")
-        if dd > 0.20:
-            parts.append("drawdown>20%")
-        elif dd > 0.15:
-            parts.append("drawdown>15%")
-        elif dd > 0.10:
-            parts.append("drawdown>10%")
+        if dd > dd_l3:
+            parts.append(f"drawdown>{dd_l3:.0%}")
+        elif dd > dd_l2:
+            parts.append(f"drawdown>{dd_l2:.0%}")
+        elif dd > dd_l1:
+            parts.append(f"drawdown>{dd_l1:.0%}")
         if dl > hard:
             parts.append("daily_loss>hard")
         elif dl > soft:

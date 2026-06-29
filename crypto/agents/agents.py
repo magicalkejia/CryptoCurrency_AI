@@ -29,7 +29,8 @@ def new_state(symbol: str, decision_time) -> Dict[str, Any]:
         "meta_trade_prob_calibrated": None, "confidence": None,
         "risk_approved": None, "risk_level": None, "target_position": 0.0,
         "vol_target_scalar": None, "stop_loss": None, "take_profit": None,
-        "circuit_breaker_level": 0,
+        "circuit_breaker_level": 0, "circuit_breaker_reason": "ok",
+        "target_position_pre_portfolio": None,
         "action": "no_trade", "execution_status": None, "filled_price": None,
         "reason": "", "review": None,
     }
@@ -50,16 +51,17 @@ class SignalResearchAgent:
     """Surfaces base-model predictions already carried in the feature row
     (market model + PatchTST forecasts) for transparency/audit."""
     def run(self, state, ctx, feature_cols):
-        row = state["feat_row"] or {}
-        preds = {c: row.get(c) for c in feature_cols if c.startswith("patchtst_forecast_")}
-        state["base_model_pred"] = preds
+        out = REGISTRY.call("signal_infer", ctx, feat_row=state["feat_row"] or {},
+                            feature_cols=feature_cols)
+        state["base_model_pred"] = out["base_model_pred"]
         return state
 
 
 class NarrativeAgent:
-    def run(self, state, ctx, texts=None, llm_fn=None):
+    def run(self, state, ctx, texts=None, llm_fn=None, precomputed=None):
         out = REGISTRY.call("narrative_infer", ctx, symbol=state["symbol"],
-                            decision_time=state["decision_time"], texts=texts, llm_fn=llm_fn)
+                            decision_time=state["decision_time"], texts=texts,
+                            llm_fn=llm_fn, precomputed=precomputed)
         state["narrative"] = out
         state["narrative_alpha"] = out.get("narrative_alpha")
         return state
@@ -99,13 +101,56 @@ class RiskAgent:
         return state
 
 
+class RiskGuardAgent:
+    """B1: computes the live circuit-breaker LEVEL from portfolio equity state and
+    writes it onto the state, so the Risk agent reacts to a real cb_level instead
+    of a hardcoded 0 (v6 §8.8)."""
+    def run(self, state, ctx, circuit_breaker, drawdown=0.0, daily_loss=0.0,
+            rolling_abs_daily_returns=None, connection_ok=True,
+            reconciliation_ok=True, kill_switch=False):
+        out = REGISTRY.call("compute_circuit_breaker", ctx,
+                            circuit_breaker=circuit_breaker, drawdown=drawdown,
+                            daily_loss=daily_loss,
+                            rolling_abs_daily_returns=rolling_abs_daily_returns,
+                            connection_ok=connection_ok, reconciliation_ok=reconciliation_ok,
+                            kill_switch=kill_switch)
+        state["circuit_breaker_level"] = out["cb_level"]
+        state["circuit_breaker_reason"] = out["cb_reason"]
+        return state
+
+
+class PortfolioAgent:
+    """A2: applies the cross-symbol portfolio risk overlay to a BATCH of per-symbol
+    states (v6 §8.2). Mutates each state's target_position in place and returns the
+    portfolio report. Positions zeroed by the overlay are demoted to no_trade."""
+    def run(self, states, ctx, fcfg, close_panel, equity_drawdown=0.0, bars_per_year=2190):
+        intents = {s["symbol"]: {"target_position": s["target_position"],
+                                 "direction": s.get("primary_direction")}
+                   for s in states if s.get("risk_approved")}
+        if not intents:
+            return states, {"note": "no_approved_intents"}
+        out = REGISTRY.call("portfolio_risk_overlay", ctx, intents=intents,
+                            close_panel=close_panel, fcfg=fcfg,
+                            equity_drawdown=equity_drawdown, bars_per_year=bars_per_year)
+        adj = out["adjusted_positions"]
+        for s in states:
+            if s["symbol"] in adj:
+                s["target_position_pre_portfolio"] = s["target_position"]
+                s["target_position"] = adj[s["symbol"]]
+                if abs(s["target_position"]) <= 1e-9:
+                    s["risk_approved"] = False
+                    s["action"] = "no_trade"
+                    s["reason"] = (s.get("reason", "") + " | portfolio_overlay_zeroed").strip(" |")
+        return states, out["portfolio_report"]
+
+
 class ExecutionAgent:
     def run(self, state, ctx, broker, ref_price, available_liquidity=1e9):
-        if not state["risk_approved"]:
-            state["execution_status"] = "not_submitted"
-            return state
+        # Always call execute_paper so the Execution stage is logged in the audit
+        # trail (it short-circuits to NOT_SUBMITTED when there is nothing to trade).
+        tgt = state["target_position"] if state.get("risk_approved") else 0.0
         out = REGISTRY.call("execute_paper", ctx, broker=broker, symbol=state["symbol"],
-                            target_position=state["target_position"], ref_price=ref_price,
+                            target_position=tgt, ref_price=ref_price,
                             available_liquidity=available_liquidity)
         state["execution_status"] = out["execution_status"]
         state["filled_price"] = out["filled_price"]

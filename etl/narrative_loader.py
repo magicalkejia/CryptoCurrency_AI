@@ -78,3 +78,53 @@ def attach_narrative(dataset: pd.DataFrame, modality_cols: dict, narr_feats: pd.
 
     modality_cols["narrative"] = list(FEATURE_COLS)
     return dataset, modality_cols
+
+
+def load_event_features(path: str) -> pd.DataFrame:
+    feats = _read_any(path)
+    feats["ts"] = pd.to_datetime(feats["ts"], utc=True, errors="coerce")
+    return feats.dropna(subset=["ts"]).sort_values(["symbol", "ts"]).reset_index(drop=True)
+
+
+def attach_event_features(dataset: pd.DataFrame, modality_cols: dict, event_feats: pd.DataFrame,
+                          time_col: str = "decision_time", symbol_col: str = "symbol",
+                          buffer_min: int = 0) -> tuple[pd.DataFrame, dict]:
+    """PIT asof-merge the LLM event features (Stage 1.5/2) onto `dataset`, exactly
+    like attach_narrative, and register them under their OWN 'event' modality so the
+    incremental study can isolate them as a dedicated `Step3b_+event` (v6 §7.1/§7.3),
+    distinct from the CryptoBERT 'narrative' sentiment modality."""
+    from etl.build_event_features import EVENT_FEATURE_COLS
+    dt = pd.to_datetime(dataset[time_col])
+    if getattr(dt.dt, "tz", None) is not None:
+        dt = dt.dt.tz_convert("UTC").dt.tz_localize(None)
+    dataset["_tkr"] = dataset[symbol_col].map(_base_ticker)
+    dataset["_asof"] = (dt - pd.Timedelta(minutes=int(buffer_min))).astype("datetime64[ns]")
+    dataset["_ridx"] = np.arange(len(dataset))
+
+    ev = event_feats.copy()
+    ev["symbol"] = ev["symbol"].map(_base_ticker)
+    ets = pd.to_datetime(ev["ts"], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+    ev["ts"] = ets.astype("datetime64[ns]")
+
+    pieces = []
+    for tkr, left in dataset.groupby("_tkr", sort=False):
+        left = left.sort_values("_asof")
+        right = ev[ev["symbol"] == tkr][["ts"] + EVENT_FEATURE_COLS].sort_values("ts")
+        if right.empty:
+            merged = left[["_ridx"]].copy()
+            for c in EVENT_FEATURE_COLS:
+                merged[c] = 0.0
+        else:
+            merged = pd.merge_asof(left[["_ridx", "_asof"]], right, left_on="_asof",
+                                   right_on="ts", direction="backward", allow_exact_matches=True)
+            merged[EVENT_FEATURE_COLS] = merged[EVENT_FEATURE_COLS].fillna(0.0)
+        pieces.append(merged[["_ridx"] + EVENT_FEATURE_COLS])
+
+    out = pd.concat(pieces).set_index("_ridx").sort_index()
+    for c in EVENT_FEATURE_COLS:
+        dataset[c] = out[c].to_numpy()
+    dataset.drop(columns=["_tkr", "_asof", "_ridx"], inplace=True, errors="ignore")
+
+    existing = list(modality_cols.get("event", []))
+    modality_cols["event"] = existing + [c for c in EVENT_FEATURE_COLS if c not in existing]
+    return dataset, modality_cols

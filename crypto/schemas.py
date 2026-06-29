@@ -87,6 +87,18 @@ class RiskConfig:
     max_pos_per_symbol: float = 0.25
     gross_cap: float = 1.0
     eps: float = 1e-9
+    # --- portfolio-level risk overlay (v6 §8.2; consumed by crypto.risk.portfolio) --- #
+    # NOTE: adding these fields changes config_hash(); that is intentional — portfolio
+    # risk is a new strategy component, so it is an honest new frozen configuration.
+    max_cluster_weight: float = 0.50      # max sum|w| within one correlated cluster
+    target_portfolio_vol: float = 0.25    # annualized portfolio vol target (delever only)
+    portfolio_vol_max_scale: float = 1.0  # 1.0 = only ever delever, never lever up
+    corr_window: int = 90                 # 4h bars used for the rolling corr/cov (~15d)
+    corr_penalty: float = 0.50            # strength of the correlation haircut
+    corr_floor: float = 0.30              # corr below this is not penalized
+    dd_scale_start: float = 0.10          # portfolio drawdown where smooth delever begins
+    dd_scale_stop: float = 0.20           # drawdown where it reaches dd_scale_floor
+    dd_scale_floor: float = 0.0           # residual size multiplier at/after dd_scale_stop
 
 
 @dataclass(frozen=True)

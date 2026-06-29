@@ -138,13 +138,36 @@ class SentimentConfig:
 
     COINDESK_ARCHIVE_BASE_URL = "https://www.coindesk.com/sitemap/archive"
     COINDESK_ARCHIVE_OUTPUT_NAME = "coindesk_archive_index.parquet"
+    # DEPRECATED: the two raw CoinDesk files below were merged (with cryptoslate) by a
+    # teammate into a single processed file and then deleted. Kept only for reference.
     COINDESK_ARTICLE_DETAIL_OUTPUT_NAME = "coindesk_article_details.parquet"
     COINDESK_ARTICLE_BODY_OUTPUT_NAME = "coindesk_article_bodies.parquet"
 
-    CRYPTOSLATE_NEWS_BASE_URL = "https://cryptoslate.com/news"
-    CRYPTOSLATE_ARCHIVE_OUTPUT_NAME = "cryptoslate_archive_index.parquet"
-    CRYPTOSLATE_ARTICLE_DETAIL_OUTPUT_NAME = "cryptoslate_article_details.parquet"
-    CRYPTOSLATE_ARTICLE_BODY_OUTPUT_NAME = "cryptoslate_article_bodies.parquet"
+    # Merged news corpus (coindesk + cryptoslate), the single input to the LLM event
+    # extraction. Lives under PathConfig.PROCESSED_SENTIMENT
+    # (= data_storage/processed/sentiment/). Columns: source, url, title,
+    # published_at (ms epoch), published_date, section, author, description,
+    # asset_type, sentiment_label, article_text.
+    MERGED_NEWS_INPUT_NAME = "merged_news_for_llm.parquet"
+
+    # LLM event/narrative extraction (A1; produced by etl.extract_events_llm +
+    # etl.build_event_features). Stored under data_storage/factors/sentiment/.
+    EVENTS_LLM_OUTPUT_NAME = "events_llm.parquet"
+    EVENT_FEATURES_OUTPUT_NAME = "event_features.parquet"
+
+
+class LLMConfig:
+    """DeepSeek (and compatible) LLM configuration for narrative/event extraction.
+
+    Set DEEPSEEK_API_KEY in the project .env. DeepSeek is OpenAI-compatible, so the
+    extractor uses the `openai` SDK pointed at DEEPSEEK_BASE_URL.
+    """
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")          # <-- put your key in .env
+    DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.0"))   # 0 for reproducibility
+    LLM_MAX_BODY_CHARS = int(os.getenv("LLM_MAX_BODY_CHARS", "4000"))
+    LLM_CONSISTENCY_RUNS = int(os.getenv("LLM_CONSISTENCY_RUNS", "1"))  # >1 = agreement score
 
 
 def init_directories():
