@@ -29,9 +29,18 @@ class DataLoader:
         self.raw_oi_dir = Path(
             getattr(config.PathConfig, "RAW_OI", self.raw_derivatives_dir / "oi")
         )
+        self.raw_spot_dir = Path(
+            getattr(config.PathConfig, "RAW_SPOT", self.raw_dir / "spot")
+        )
 
         self.processed_derivatives_dir = Path(
             getattr(config.PathConfig, "PROCESSED_DERIVATIVES", self.processed_dir / "derivatives")
+        )
+        self.processed_spot_dir = Path(
+            getattr(config.PathConfig, "PROCESSED_SPOT", self.processed_dir / "spot")
+        )
+        self.processed_flow_dir = Path(
+            getattr(config.PathConfig, "PROCESSED_FLOW", self.processed_dir / "flow")
         )
         self.raw_onchain_dir = Path(
             getattr(config.PathConfig, "RAW_ONCHAIN", self.raw_dir / "onchain")
@@ -389,6 +398,140 @@ class DataLoader:
         idx = df.groupby("symbol")["timestamp"].idxmax()
         latest = df.loc[idx].sort_values("symbol").reset_index(drop=True)
         return latest[["symbol", "timestamp", field]]
+
+    # =====================================================================
+    # Spot / basis / CVD query interfaces
+    # =====================================================================
+    def _filter_long_table(
+        self,
+        df: pd.DataFrame,
+        symbol=None,
+        symbols=None,
+        start_date=None,
+        end_date=None,
+        columns=None,
+        as_index: bool = True,
+    ):
+        if df is None:
+            return None
+        if df.empty:
+            return df
+
+        if symbol is not None:
+            symbols = [symbol]
+        elif symbols is not None:
+            symbols = list(symbols)
+
+        df = df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+
+        if symbols is not None:
+            df = df[df["symbol"].isin(symbols)].copy()
+        if start_date is not None:
+            df = df[df["timestamp"] >= pd.to_datetime(start_date)]
+        if end_date is not None:
+            df = df[df["timestamp"] <= pd.to_datetime(end_date)]
+
+        if columns is not None:
+            if isinstance(columns, str):
+                columns = [columns]
+            base_cols = ["timestamp", "symbol"]
+            if "timeframe" in df.columns:
+                base_cols.append("timeframe")
+            selected = base_cols + [c for c in columns if c not in base_cols]
+            missing = [c for c in selected if c not in df.columns]
+            if missing:
+                raise ValueError(f"Invalid columns: {missing}")
+            df = df[selected]
+
+        sort_cols = ["symbol", "timestamp"]
+        if "timeframe" in df.columns:
+            sort_cols = ["symbol", "timeframe", "timestamp"]
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+
+        if as_index and symbols is not None and len(symbols) == 1:
+            return df.set_index("timestamp")
+        return df
+
+    def get_spot_kline_data(
+        self,
+        symbol=None,
+        symbols=None,
+        timeframe: str = "4h",
+        start_date=None,
+        end_date=None,
+        columns=None,
+        as_index: bool = True,
+    ):
+        path = self.processed_spot_dir / f"spot_klines_{timeframe}.parquet"
+        if not path.exists():
+            print(f"[WARN] Processed spot table not found: {path}")
+            return None
+        df = pd.read_parquet(path)
+        return self._filter_long_table(
+            df,
+            symbol=symbol,
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            columns=columns,
+            as_index=as_index,
+        )
+
+    def get_spot_perp_basis_data(
+        self,
+        symbol=None,
+        symbols=None,
+        timeframe: str | None = "4h",
+        start_date=None,
+        end_date=None,
+        columns=None,
+        as_index: bool = True,
+    ):
+        path = self.processed_derivatives_dir / "spot_perp_basis.parquet"
+        if not path.exists():
+            print(f"[WARN] Processed spot/perp basis table not found: {path}")
+            return None
+        df = pd.read_parquet(path)
+        if timeframe is not None and "timeframe" in df.columns:
+            df = df[df["timeframe"] == timeframe].copy()
+        return self._filter_long_table(
+            df,
+            symbol=symbol,
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            columns=columns,
+            as_index=as_index,
+        )
+
+    def get_cvd_data(
+        self,
+        symbol=None,
+        symbols=None,
+        timeframe: str | None = "4h",
+        start_date=None,
+        end_date=None,
+        columns=None,
+        as_index: bool = True,
+    ):
+        path = self.processed_flow_dir / "cvd.parquet"
+        if not path.exists():
+            print(f"[WARN] Processed CVD table not found: {path}")
+            return None
+        df = pd.read_parquet(path)
+        if timeframe is not None and "timeframe" in df.columns:
+            df = df[df["timeframe"] == timeframe].copy()
+        return self._filter_long_table(
+            df,
+            symbol=symbol,
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            columns=columns,
+            as_index=as_index,
+        )
 
     # =====================================================================
     # On-chain data query interfaces
