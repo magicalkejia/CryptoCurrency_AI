@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import pandas as pd
 import numpy as np
+from backtest.annualization import resolve_annual_periods
 from backtest.records import build_trade_records, build_position_records
 @dataclass
 class BacktestConfig:
@@ -10,9 +11,29 @@ class BacktestConfig:
     fee_rate: float = 0.0015
     slippage_rate: float = 0.0
     execution_lag: int = 1
-    annual_days: int = 252
+    # Legacy name kept for compatibility.  It means "periods per year", not
+    # necessarily calendar days.  New code can set market/timeframe or
+    # annual_periods directly.
+    annual_days: int | None = None
+    annual_periods: int | None = None
+    market: str = "stock"
+    timeframe: str = "1d"
     warmup_days: int = 0
+    warmup_bars: int | None = None
     normalize_weight: bool = True
+
+    @property
+    def periods_per_year(self) -> int:
+        return resolve_annual_periods(
+            annual_periods=self.annual_periods,
+            annual_days=self.annual_days,
+            market=self.market,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def warmup_periods(self) -> int:
+        return int(self.warmup_bars if self.warmup_bars is not None else self.warmup_days)
 
 
 def align_data(close: pd.DataFrame, target_weight: pd.DataFrame):
@@ -77,8 +98,8 @@ def run_vector_backtest(
     # 组合日收益
     portfolio_returns = (actual_weight * asset_returns).sum(axis=1) - cost
 
-    if config.warmup_days > 0:
-        portfolio_returns = portfolio_returns.iloc[config.warmup_days:]
+    if config.warmup_periods > 0:
+        portfolio_returns = portfolio_returns.iloc[config.warmup_periods:]
         actual_weight = actual_weight.loc[portfolio_returns.index]
         turnover = turnover.loc[portfolio_returns.index]
         cost = cost.loc[portfolio_returns.index]
@@ -112,6 +133,7 @@ def run_vector_backtest(
         "trades": trades,
         "positions": positions,
         "asset_returns": asset_returns,
+        "annual_periods": config.periods_per_year,
     }
 
     return result

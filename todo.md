@@ -6,3 +6,4 @@
 6. [X] handle sentiment data
 7. [X] apply processed sentiment data in feature trainset
 8. [X] CVD Spot premium data update
+9. [X] bars per year issues fix for crypto and compatiliized

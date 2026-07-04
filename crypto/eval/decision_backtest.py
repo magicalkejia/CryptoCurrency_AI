@@ -31,7 +31,7 @@ How
    untouched.)
 4. Hand the final panel to `run_vector_backtest(close, weight, config)` AS-IS.
 
-Symbols, the 4h grid, execution_lag=1 and annual_days=bars_per_year all match the
+Symbols, the 4h grid, execution_lag=1 and periods_per_year=bars_per_year all match the
 convention `_panel_to_returns` already uses in incremental_study, so results are
 directly comparable to the ladder steps.
 """
@@ -56,7 +56,7 @@ CB_POS_MULT = {0: 1.0, 1: 1.0, 2: 0.5, 3: 0.0, 4: 0.0}
 def _bt_config(fcfg, bars_per_year: int) -> BacktestConfig:
     fee, slip = _cost_rates(fcfg)
     return BacktestConfig(fee_rate=fee, slippage_rate=slip, execution_lag=1,
-                          annual_days=int(bars_per_year))
+                          annual_periods=int(bars_per_year), market="crypto", timeframe="4h")
 
 
 def _panel_returns(close_panel, w, fcfg, bars_per_year):
@@ -159,7 +159,8 @@ def build_decision_weight_panel(dataset, signals, close_panel, fcfg, *,
                 dq = check_data_quality(r, [c for c in dq_cols if c in r])
                 conf = compute_confidence(r, fusion_out, dq["data_quality_score"])["confidence"]
                 risk = risk_size_and_gate(fusion_out, conf, r, fcfg, cb_level=0,
-                                          use_meta_gate=use_meta_gate)
+                                          use_meta_gate=use_meta_gate,
+                                          bars_per_year=bars_per_year)
                 reason = str(risk.get("reason", ""))
                 if risk["risk_approved"] and abs(risk["target_position"]) > 1e-12:
                     funnel["approved_intents"] += 1
@@ -316,14 +317,15 @@ def run_decision_backtest(dataset, signals, close_panel, fcfg, *, bars_per_year:
     if full_report:
         from backtest.quick import quick_backtest
         res = quick_backtest(cp, W, strategy_name=strategy_name, fee_rate=fee, slippage_rate=slip,
-                             execution_lag=1, annual_days=bars_per_year, output_root=output_root,
+                             execution_lag=1, annual_periods=bars_per_year,
+                             market="crypto", timeframe="4h", output_root=output_root,
                              save=True, display=False)
         return {"result": res, "metrics": res.metrics, "weights": W, "info": info}
 
     raw = run_vector_backtest(cp, W, config=_bt_config(fcfg, bars_per_year),
                               strategy_name=strategy_name)
     metrics = calc_full_metrics(raw["returns"], turnover=raw["turnover"], cost=raw["cost"],
-                                weights=raw["weights"], annual_days=bars_per_year)
+                                weights=raw["weights"], annual_periods=bars_per_year)
     return {"raw": raw, "metrics": metrics, "weights": W, "info": info}
 
 
@@ -393,7 +395,7 @@ def run_directional_decision_backtest(W_signal, close_panel, fcfg, *, bars_per_y
     W = W.reindex(cp.index).fillna(0.0)
     raw = run_vector_backtest(cp, W, config=_bt_config(fcfg, bars_per_year), strategy_name=strategy_name)
     metrics = calc_full_metrics(raw["returns"], turnover=raw["turnover"], cost=raw["cost"],
-                                weights=raw["weights"], annual_days=bars_per_year)
+                                weights=raw["weights"], annual_periods=bars_per_year)
     return {"raw": raw, "metrics": metrics, "weights": W, "info": info}
 
 

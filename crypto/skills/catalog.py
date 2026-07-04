@@ -147,7 +147,8 @@ def compute_confidence(feat_row: dict, fusion_out: dict, data_quality: float) ->
 # ----------------------------- Risk (highest authority) -------------------- #
 @REGISTRY.register("risk_size_and_gate", "risk")
 def risk_size_and_gate(fusion_out: dict, confidence: float, feat_row: dict,
-                       fcfg, cb_level: int = 0, use_meta_gate: bool = True) -> dict:
+                       fcfg, cb_level: int = 0, use_meta_gate: bool = True,
+                       bars_per_year: int = 2190) -> dict:
     r = fcfg.risk
     direction = fusion_out["primary_direction"]
     meta = fusion_out.get("meta_trade_prob_calibrated", np.nan)
@@ -180,7 +181,7 @@ def risk_size_and_gate(fusion_out: dict, confidence: float, feat_row: dict,
         gate_reason = f"conv={conviction:.2f}(no_meta_gate)"
 
     vol = _feat_vol(feat_row)
-    realized_ann = (vol * np.sqrt(2190)) if (vol and not np.isnan(vol)) else None
+    realized_ann = (vol * np.sqrt(int(bars_per_year))) if (vol and not np.isnan(vol)) else None
     if realized_ann is None or realized_ann <= r.eps:
         vts = 0.0
     else:

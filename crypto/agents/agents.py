@@ -85,10 +85,10 @@ class FusionAgent:
 
 class RiskAgent:
     """Highest authority: can veto regardless of signal strength (v6 §8 / 原则3)."""
-    def run(self, state, ctx, fcfg, cb_level=0):
+    def run(self, state, ctx, fcfg, cb_level=0, bars_per_year=2190):
         out = REGISTRY.call("risk_size_and_gate", ctx, fusion_out=state["_fusion_out"],
                             confidence=state["confidence"], feat_row=state["feat_row"],
-                            fcfg=fcfg, cb_level=cb_level)
+                            fcfg=fcfg, cb_level=cb_level, bars_per_year=bars_per_year)
         state["risk_approved"] = out["risk_approved"]
         state["risk_level"] = out["risk_level"]
         state["target_position"] = out["target_position"]
