@@ -9,6 +9,11 @@ def run_pipeline(
     fetch_derivatives: bool = False,
     fetch_oi: bool = False,
     skip_market: bool = False,
+    fetch_spot: bool = False,
+    process_spot: bool = False,
+    build_basis: bool = False,
+    build_cvd: bool = False,
+    flow_timeframe: str = "4h",
     fetch_onchain: bool = False,
     process_onchain: bool = False,
     build_onchain_factors: bool = False,
@@ -24,6 +29,11 @@ def run_pipeline(
             fetch_oi=fetch_oi,
             fetch_market=not skip_market,
             process_market=not skip_market,
+            fetch_spot=fetch_spot,
+            process_spot=process_spot,
+            build_basis=build_basis,
+            build_cvd=build_cvd,
+            flow_timeframe=flow_timeframe,
             fetch_onchain=fetch_onchain,
             process_onchain=process_onchain,
             build_onchain_factors=build_onchain_factors,
@@ -51,6 +61,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fetch-oi", action="store_true", help="Also fetch open-interest raw data.")
     parser.add_argument("--skip-market", action="store_true", help="Skip market K-line fetch/process steps.")
+    parser.add_argument("--fetch-spot", action="store_true", help="Fetch Binance spot K-line raw data.")
+    parser.add_argument("--process-spot", action="store_true", help="Build processed spot long table.")
+    parser.add_argument("--build-basis", action="store_true", help="Build processed spot/perp basis table.")
+    parser.add_argument("--build-cvd", action="store_true", help="Build processed taker-CVD table.")
+    parser.add_argument("--flow-timeframe", default="4h", help="Timeframe for spot/basis/CVD processed tables.")
     parser.add_argument("--fetch-onchain", action="store_true", help="Fetch DefiLlama on-chain raw data.")
     parser.add_argument("--process-onchain", action="store_true", help="Build processed on-chain daily tables.")
     parser.add_argument("--build-onchain-factors", action="store_true", help="Build factors/onchain_features.parquet.")
@@ -69,6 +84,11 @@ if __name__ == "__main__":
         fetch_derivatives=args.fetch_derivatives,
         fetch_oi=args.fetch_oi,
         skip_market=args.skip_market,
+        fetch_spot=args.fetch_spot,
+        process_spot=args.process_spot,
+        build_basis=args.build_basis,
+        build_cvd=args.build_cvd,
+        flow_timeframe=args.flow_timeframe,
         fetch_onchain=args.fetch_onchain,
         process_onchain=args.process_onchain,
         build_onchain_factors=args.build_onchain_factors,

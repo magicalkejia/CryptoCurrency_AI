@@ -30,14 +30,20 @@ FeatureBuilderName = Literal["none", "multimodal"]
 @dataclass
 class CryptoPipelineConfig:
     symbols: Sequence[str] = field(default_factory=lambda: list(config.TargetConfig.COINS))
+    spot_symbols: Sequence[str] = field(default_factory=lambda: list(config.TargetConfig.DIVERSIFIED_10_COINS))
     #K线数据
     fetch_market: bool = True
     process_market: bool = True
+    fetch_spot: bool = False
+    process_spot: bool = False
 
     #衍生数据
     fetch_derivatives: bool = False
     fetch_oi: bool = False
     process_derivatives: bool = True
+    build_basis: bool = False
+    build_cvd: bool = False
+    flow_timeframe: str = "4h"
     
     #链上数据
     fetch_onchain: bool = False
@@ -60,11 +66,17 @@ def run_crypto_pipeline(
     *,
     cfg: CryptoPipelineConfig | None = None,
     symbols: Sequence[str] | None = None,
+    spot_symbols: Sequence[str] | None = None,
     fetch_market: bool | None = None,
     process_market: bool | None = None,
+    fetch_spot: bool = False,
+    process_spot: bool = False,
     fetch_onchain: bool = False,
     process_onchain: bool = False,
     build_onchain_factors: bool = False,
+    build_basis: bool = False,
+    build_cvd: bool = False,
+    flow_timeframe: str = "4h",
     build_model_features: bool = False,
     feature_builder: FeatureBuilderName = "none",
     onchain_chains: Sequence[str] | None = None,
@@ -89,10 +101,16 @@ def run_crypto_pipeline(
     if cfg is None:
         cfg = CryptoPipelineConfig(
             symbols=list(symbols or config.TargetConfig.COINS),
+            spot_symbols=list(spot_symbols or config.TargetConfig.DIVERSIFIED_10_COINS),
             fetch_market=True if fetch_market is None else fetch_market,
             process_market=True if process_market is None else process_market,
+            fetch_spot=fetch_spot,
+            process_spot=process_spot,
             fetch_derivatives=fetch_derivatives,
             fetch_oi=fetch_oi,
+            build_basis=build_basis,
+            build_cvd=build_cvd,
+            flow_timeframe=flow_timeframe,
             fetch_onchain=fetch_onchain,
             process_onchain=process_onchain,
             build_onchain_factors=build_onchain_factors,
@@ -112,7 +130,15 @@ def run_crypto_pipeline(
         "features": {},
     }
 
-    if cfg.fetch_market or cfg.process_market or cfg.fetch_derivatives:
+    if (
+        cfg.fetch_market
+        or cfg.process_market
+        or cfg.fetch_spot
+        or cfg.process_spot
+        or cfg.fetch_derivatives
+        or cfg.build_basis
+        or cfg.build_cvd
+    ):
         result["market"] = _run_market_and_derivatives(cfg)
 
     if cfg.fetch_onchain:
@@ -135,8 +161,13 @@ def run_crypto_pipeline(
 
 def _run_market_and_derivatives(cfg: CryptoPipelineConfig) -> pd.DataFrame:
     rows = []
+    summary_symbols = (
+        list(cfg.symbols)
+        if (cfg.fetch_market or cfg.process_market or cfg.fetch_derivatives)
+        else list(cfg.spot_symbols)
+    )
 
-    for symbol in cfg.symbols:
+    for symbol in summary_symbols:
         ok_fetch = None
         ok_clean = None
         ok_resample = None
@@ -171,10 +202,45 @@ def _run_market_and_derivatives(cfg: CryptoPipelineConfig) -> pd.DataFrame:
 
     out = pd.DataFrame(rows)
 
+    if cfg.fetch_spot:
+        spot_rows = []
+        for symbol in cfg.spot_symbols:
+            spot_rows.append({
+                "symbol": symbol,
+                "spot_raw": data_updater.fetch_spot_data(symbol),
+            })
+        out.attrs["spot_raw"] = pd.DataFrame(spot_rows)
+
     if cfg.fetch_derivatives and cfg.process_derivatives:
         funding_long = data_processor.process_funding_rates(list(cfg.symbols))
         out.attrs["processed_funding_rows"] = None if funding_long is None else len(funding_long)
         print(f"processed funding long table rows: {out.attrs['processed_funding_rows']}")
+
+    if cfg.process_spot:
+        spot_tables = data_processor.process_spot_klines(
+            symbols=list(cfg.spot_symbols),
+            timeframes=(cfg.flow_timeframe,),
+        )
+        out.attrs["processed_spot_rows"] = {
+            tf: len(df) for tf, df in spot_tables.items()
+        }
+        print(f"processed spot rows: {out.attrs['processed_spot_rows']}")
+
+    if cfg.build_basis:
+        basis = data_processor.process_spot_perp_basis(
+            symbols=list(cfg.spot_symbols),
+            timeframe=cfg.flow_timeframe,
+        )
+        out.attrs["processed_basis_rows"] = None if basis is None else len(basis)
+        print(f"processed spot/perp basis rows: {out.attrs['processed_basis_rows']}")
+
+    if cfg.build_cvd:
+        cvd = data_processor.process_cvd(
+            symbols=list(cfg.spot_symbols),
+            timeframe=cfg.flow_timeframe,
+        )
+        out.attrs["processed_cvd_rows"] = None if cvd is None else len(cvd)
+        print(f"processed CVD rows: {out.attrs['processed_cvd_rows']}")
 
     print(out)
     return out

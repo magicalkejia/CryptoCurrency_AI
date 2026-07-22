@@ -34,6 +34,7 @@ class PathConfig:
     RAW_FUNDING = RAW_DERIVATIVES / "funding"
     RAW_OI = RAW_DERIVATIVES / "oi"
     RAW_LONG_SHORT_RATIO = RAW_DERIVATIVES / "long_short_ratio"
+    RAW_SPOT = RAW / "spot"
 
     RAW_FLOW = RAW / "flow"
     RAW_SPOT_CVD = RAW_FLOW / "spot_cvd"
@@ -43,6 +44,7 @@ class PathConfig:
 
     # Processed source-specific directories
     PROCESSED_DERIVATIVES = PROCESSED / "derivatives"
+    PROCESSED_SPOT = PROCESSED / "spot"
     PROCESSED_FLOW = PROCESSED / "flow"
     PROCESSED_SENTIMENT = PROCESSED / "sentiment"
     PROCESSED_ONCHAIN = PROCESSED / "onchain"
@@ -193,12 +195,14 @@ def init_directories():
         PathConfig.RAW_FUNDING,
         PathConfig.RAW_OI,
         PathConfig.RAW_LONG_SHORT_RATIO,
+        PathConfig.RAW_SPOT,
         PathConfig.RAW_FLOW,
         PathConfig.RAW_SPOT_CVD,
         PathConfig.RAW_SENTIMENT,
         PathConfig.RAW_ONCHAIN,
 
         PathConfig.PROCESSED_DERIVATIVES,
+        PathConfig.PROCESSED_SPOT,
         PathConfig.PROCESSED_FLOW,
         PathConfig.PROCESSED_SENTIMENT,
         PathConfig.PROCESSED_ONCHAIN,

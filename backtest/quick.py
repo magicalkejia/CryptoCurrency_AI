@@ -6,6 +6,7 @@ import json
 import pandas as pd
 
 from backtest.engine import run_vector_backtest, BacktestConfig
+from backtest.annualization import resolve_annual_periods
 from backtest.metrics import calc_full_metrics
 from backtest.records import save_backtest_records
 from backtest.report import (
@@ -61,13 +62,22 @@ def quick_backtest(
     fee_rate: float = 0.0015,
     slippage_rate: float = 0.0,
     execution_lag: int = 1,
-    annual_days: int = 252,
+    annual_days: int | None = None,
+    annual_periods: int | None = None,
+    market: str = "stock",
+    timeframe: str = "1d",
     output_root: str = "data_storage/backtest_results",
     save: bool = True,
     display: bool = True,
 ):
     experiment_id = make_experiment_id(strategy_name, experiment_name)
     output_dir = Path(output_root) / experiment_id
+    periods_per_year = resolve_annual_periods(
+        annual_periods=annual_periods,
+        annual_days=annual_days,
+        market=market,
+        timeframe=timeframe,
+    )
 
     config = BacktestConfig(
         initial_cash=initial_cash,
@@ -75,6 +85,9 @@ def quick_backtest(
         slippage_rate=slippage_rate,
         execution_lag=execution_lag,
         annual_days=annual_days,
+        annual_periods=periods_per_year,
+        market=market,
+        timeframe=timeframe,
     )
 
     raw_result = run_vector_backtest(
@@ -92,7 +105,7 @@ def quick_backtest(
         turnover=raw_result["turnover"],
         cost=raw_result["cost"],
         weights=raw_result["weights"],
-        annual_days=annual_days,
+        annual_periods=periods_per_year,
     )
 
     result = BacktestResult(
@@ -135,7 +148,10 @@ def quick_backtest(
             "fee_rate": fee_rate,
             "slippage_rate": slippage_rate,
             "execution_lag": execution_lag,
-            "annual_days": annual_days,
+            "annual_days": periods_per_year,
+            "annual_periods": periods_per_year,
+            "market": market,
+            "timeframe": timeframe,
             "created_at": datetime.now().isoformat(),
         }
 
@@ -147,6 +163,7 @@ def quick_backtest(
             benchmark_returns=benchmark_returns,
             output_path=output_dir / "quantstats_report.html",
             title=strategy_name,
+            periods_per_year=periods_per_year,
         )
 
         plot_nav(

@@ -34,6 +34,10 @@ def _legacy_raw_oi_path(symbol: str) -> Path:
     return config.PathConfig.RAW / f"{symbol_key(symbol)}_oi.parquet"
 
 
+def _raw_spot_path(symbol: str, timeframe: str = "1m") -> Path:
+    return config.PathConfig.RAW_SPOT / f"{symbol_key(symbol)}_{timeframe}.parquet"
+
+
 def merge_incremental_data(
     df_old: pd.DataFrame | None,
     df_new: pd.DataFrame,
@@ -86,6 +90,15 @@ def merge_incremental_data(
 def get_exchange():
     """初始化交易所，使用 SpiderConfig 配置。"""
     return ccxt.binanceusdm({
+        "enableRateLimit": True,
+        "timeout": config.SpiderConfig.TIMEOUT,
+        "proxies": config.SpiderConfig.PROXY,
+    })
+
+
+def get_spot_exchange():
+    """Initialize Binance spot exchange with the same proxy/timeout settings."""
+    return ccxt.binance({
         "enableRateLimit": True,
         "timeout": config.SpiderConfig.TIMEOUT,
         "proxies": config.SpiderConfig.PROXY,
@@ -224,6 +237,127 @@ def fetch_data(symbol):
 # =====================================================================
 # Crypto 衍生品数据采集：funding rate / open interest
 # =====================================================================
+def fetch_spot_data(symbol: str, timeframe: str | None = None) -> bool:
+    """
+    Fetch Binance spot K-lines and save a per-symbol raw parquet file.
+
+    RAW output:
+        data_storage/raw/spot/{SYMBOL}_{timeframe}.parquet
+
+    Columns:
+        timestamp, symbol, open, high, low, close, volume, taker_buy_vol,
+        source, created_at
+    """
+    exchange = get_spot_exchange()
+    symbol_clean = symbol_key(symbol)
+    timeframe = timeframe or config.TargetConfig.TIMEFRAMES["base"]
+    file_path = _raw_spot_path(symbol, timeframe=timeframe)
+
+    last_ts = get_last_timestamp(file_path)
+    if last_ts is not None:
+        since = int(pd.Timestamp(last_ts).timestamp() * 1000) + 1
+        print(f"[incremental] {symbol} spot {timeframe} from {last_ts}")
+    else:
+        since = exchange.parse8601(config.SpiderConfig.START_TIME)
+        print(f"[full] {symbol} spot {timeframe} from {config.SpiderConfig.START_TIME}")
+
+    rows = []
+    retry = 0
+    max_retry = 5
+    now = exchange.milliseconds()
+    created_at = pd.Timestamp.now(tz="UTC").tz_localize(None)
+
+    while True:
+        try:
+            klines = exchange.publicGetKlines({
+                "symbol": symbol_clean,
+                "interval": timeframe,
+                "limit": 1000,
+                "startTime": since,
+            })
+
+            if not klines:
+                break
+
+            batch = [
+                [
+                    int(k[0]),
+                    symbol,
+                    float(k[1]),
+                    float(k[2]),
+                    float(k[3]),
+                    float(k[4]),
+                    float(k[5]),
+                    float(k[9]),
+                    "binance_spot",
+                    created_at,
+                ]
+                for k in klines
+            ]
+            rows.extend(batch)
+
+            last_ts_ms = batch[-1][0]
+            since = last_ts_ms + 1
+            retry = 0
+
+            if len(rows) % 10000 < len(batch):
+                curr_date = datetime.fromtimestamp(last_ts_ms / 1000)
+                print(f"   spot progress: {symbol} {curr_date} | new rows={len(rows)}")
+
+            if last_ts_ms >= now - 120000 or len(klines) < 1000:
+                break
+            time.sleep(0.1)
+
+        except Exception as e:
+            retry += 1
+            print(f"spot network error {retry}/{max_retry}: {symbol} | {e}")
+            if retry >= max_retry:
+                return False
+            time.sleep(5)
+
+    if not rows:
+        print(f"{symbol} spot {timeframe} is already up to date")
+        return False
+
+    raw_columns = [
+        "timestamp",
+        "symbol",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "taker_buy_vol",
+        "source",
+        "created_at",
+    ]
+    df_new = pd.DataFrame(rows, columns=raw_columns)
+    df_new["timestamp"] = pd.to_datetime(df_new["timestamp"], unit="ms")
+    df_new["created_at"] = pd.to_datetime(df_new["created_at"])
+
+    df_old = None
+    if file_path.exists():
+        df_old = pd.read_parquet(file_path)
+        for col in raw_columns:
+            if col not in df_old.columns:
+                df_old[col] = np.nan
+        df_old = df_old[raw_columns].copy()
+        df_old["timestamp"] = pd.to_datetime(df_old["timestamp"], errors="coerce")
+        df_old["created_at"] = pd.to_datetime(df_old["created_at"], errors="coerce")
+
+    df_final = merge_incremental_data(
+        df_old=df_old,
+        df_new=df_new,
+        key_col=["symbol", "timestamp"],
+    )
+    df_final = df_final[raw_columns].sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    df_final.to_parquet(file_path, engine="pyarrow", compression="zstd", index=False)
+    print(f"saved {symbol} spot RAW rows={len(df_final)} -> {file_path}")
+    return True
+
+
 def fetch_funding_rate(symbol):
     """
     抓取 Binance USDM 资金费率历史，保存 RAW 原始事件表。

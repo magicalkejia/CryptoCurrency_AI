@@ -9,6 +9,7 @@ import pandas as pd
 
 import config
 from etl.data_loader import DataLoader
+from backtest.annualization import infer_annual_periods
 from backtest.quick import quick_backtest
 
 
@@ -131,13 +132,7 @@ def align_close_and_target(
 
 
 def infer_annual_days(timeframe: str) -> int:
-    return {
-        "1d": 365,
-        "4h": 365 * 6,
-        "1h": 365 * 24,
-        "15m": 365 * 24 * 4,
-        "5m": 365 * 24 * 12,
-    }.get(timeframe, 365)
+    return infer_annual_periods(timeframe=timeframe, market="crypto")
 
 
 def run_backtest_from_decisions(
@@ -172,7 +167,9 @@ def run_backtest_from_decisions(
         fee_rate=fee_rate,
         slippage_rate=slippage_rate,
         execution_lag=execution_lag,
-        annual_days=annual_days,
+        annual_periods=annual_days,
+        market="crypto",
+        timeframe=timeframe,
         output_root=str(config.PathConfig.BACKTEST_RESULTS),
         save=True,
         display=display,

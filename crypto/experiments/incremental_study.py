@@ -172,7 +172,8 @@ def _panel_to_returns(close_panel, w, bars_per_year, fcfg):
     if len(cp) < 5:
         return pd.Series(dtype=float), float("nan"), float("nan")
     fee, slip = _cost_rates(fcfg)
-    cfg = BacktestConfig(fee_rate=fee, slippage_rate=slip, execution_lag=1, annual_days=bars_per_year)
+    cfg = BacktestConfig(fee_rate=fee, slippage_rate=slip, execution_lag=1,
+                         annual_periods=bars_per_year, market="crypto", timeframe="4h")
     res = run_vector_backtest(cp, w, config=cfg, strategy_name="step")
     return (res["returns"], float(res["turnover"].mean() * bars_per_year),
             float(res["cost"].mean() * bars_per_year))

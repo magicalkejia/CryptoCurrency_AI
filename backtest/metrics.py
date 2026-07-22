@@ -3,11 +3,27 @@
 import numpy as np
 import pandas as pd
 
+from backtest.annualization import resolve_annual_periods
+
 
 def _safe_div(a, b):
     if b is None or b == 0 or pd.isna(b):
         return np.nan
     return a / b
+
+
+def _resolve_periods(
+    annual_days: int | None = None,
+    annual_periods: int | None = None,
+    market: str = "stock",
+    timeframe: str = "1d",
+) -> int:
+    return resolve_annual_periods(
+        annual_periods=annual_periods,
+        annual_days=annual_days,
+        market=market,
+        timeframe=timeframe,
+    )
 
 
 def align_returns(strategy_returns: pd.Series, benchmark_returns: pd.Series | None = None):
@@ -29,13 +45,21 @@ def calc_nav(returns: pd.Series, initial_nav: float = 1.0) -> pd.Series:
     return (1 + returns.fillna(0)).cumprod() * initial_nav
 
 
-def calc_annual_return(returns: pd.Series, annual_days: int = 252) -> float:
+def calc_annual_return(
+    returns: pd.Series,
+    annual_days: int | None = None,
+    *,
+    annual_periods: int | None = None,
+    market: str = "stock",
+    timeframe: str = "1d",
+) -> float:
     returns = returns.dropna()
     if returns.empty:
         return np.nan
 
+    periods = _resolve_periods(annual_days, annual_periods, market, timeframe)
     total_return = (1 + returns).prod() - 1
-    years = len(returns) / annual_days
+    years = len(returns) / periods
 
     if years <= 0:
         return np.nan
@@ -106,37 +130,50 @@ def calc_profit_loss_stats(returns: pd.Series) -> dict:
     }
 
 
-def calc_sortino(returns: pd.Series, annual_days: int = 252) -> float:
+def calc_sortino(
+    returns: pd.Series,
+    annual_days: int | None = None,
+    *,
+    annual_periods: int | None = None,
+    market: str = "stock",
+    timeframe: str = "1d",
+) -> float:
     returns = returns.dropna()
     downside = returns[returns < 0]
 
     if downside.empty:
         return np.nan
 
-    annual_return = calc_annual_return(returns, annual_days)
-    downside_vol = downside.std() * np.sqrt(annual_days)
+    periods = _resolve_periods(annual_days, annual_periods, market, timeframe)
+    annual_return = calc_annual_return(returns, annual_periods=periods)
+    downside_vol = downside.std() * np.sqrt(periods)
 
     return _safe_div(annual_return, downside_vol)
 
 
 def calc_basic_metrics(
     returns: pd.Series,
-    annual_days: int = 252,
+    annual_days: int | None = None,
     prefix: str = "strategy",
+    *,
+    annual_periods: int | None = None,
+    market: str = "stock",
+    timeframe: str = "1d",
 ) -> dict:
     returns = returns.dropna()
 
     if returns.empty:
         return {}
 
+    periods = _resolve_periods(annual_days, annual_periods, market, timeframe)
     nav = calc_nav(returns)
 
     total_return = nav.iloc[-1] / nav.iloc[0] - 1
-    annual_return = calc_annual_return(returns, annual_days)
-    volatility = returns.std() * np.sqrt(annual_days)
+    annual_return = calc_annual_return(returns, annual_periods=periods)
+    volatility = returns.std() * np.sqrt(periods)
 
     sharpe = _safe_div(annual_return, volatility)
-    sortino = calc_sortino(returns, annual_days)
+    sortino = calc_sortino(returns, annual_periods=periods)
 
     dd_info = calc_max_drawdown_info(nav)
     calmar = _safe_div(annual_return, abs(dd_info["max_drawdown"]))
@@ -165,21 +202,26 @@ def calc_basic_metrics(
 def calc_benchmark_metrics(
     strategy_returns: pd.Series,
     benchmark_returns: pd.Series,
-    annual_days: int = 252,
+    annual_days: int | None = None,
+    *,
+    annual_periods: int | None = None,
+    market: str = "stock",
+    timeframe: str = "1d",
 ) -> dict:
     strategy_returns, benchmark_returns = align_returns(strategy_returns, benchmark_returns)
 
     if benchmark_returns is None or benchmark_returns.empty:
         return {}
 
+    periods = _resolve_periods(annual_days, annual_periods, market, timeframe)
     strategy_nav = calc_nav(strategy_returns)
     benchmark_nav = calc_nav(benchmark_returns)
 
     excess_returns = strategy_returns - benchmark_returns
     excess_nav = strategy_nav / benchmark_nav
 
-    strategy_ann = calc_annual_return(strategy_returns, annual_days)
-    benchmark_ann = calc_annual_return(benchmark_returns, annual_days)
+    strategy_ann = calc_annual_return(strategy_returns, annual_periods=periods)
+    benchmark_ann = calc_annual_return(benchmark_returns, annual_periods=periods)
 
     beta = _safe_div(
         strategy_returns.cov(benchmark_returns),
@@ -188,20 +230,20 @@ def calc_benchmark_metrics(
 
     alpha = strategy_ann - beta * benchmark_ann if pd.notna(beta) else np.nan
 
-    tracking_error = excess_returns.std() * np.sqrt(annual_days)
+    tracking_error = excess_returns.std() * np.sqrt(periods)
     information_ratio = _safe_div(
-        excess_returns.mean() * annual_days,
+        excess_returns.mean() * periods,
         tracking_error
     )
 
     excess_total_return = excess_nav.iloc[-1] / excess_nav.iloc[0] - 1
-    excess_annual_return = calc_annual_return(excess_returns, annual_days)
+    excess_annual_return = calc_annual_return(excess_returns, annual_periods=periods)
 
     excess_dd_info = calc_max_drawdown_info(excess_nav)
 
     benchmark_metrics = calc_basic_metrics(
         benchmark_returns,
-        annual_days=annual_days,
+        annual_periods=periods,
         prefix="benchmark"
     )
 
@@ -210,12 +252,13 @@ def calc_benchmark_metrics(
         "beta": beta,
         "excess_total_return": excess_total_return,
         "excess_annual_return": excess_annual_return,
-        "excess_daily_mean": excess_returns.mean(),
+        "excess_period_mean": excess_returns.mean(),
+        "excess_daily_mean": excess_returns.mean(),  # legacy key
         "tracking_error": tracking_error,
         "information_ratio": information_ratio,
         "excess_sharpe": _safe_div(
-            excess_returns.mean() * annual_days,
-            excess_returns.std() * np.sqrt(annual_days)
+            excess_returns.mean() * periods,
+            excess_returns.std() * np.sqrt(periods)
         ),
         "excess_win_rate": (strategy_returns > benchmark_returns).mean(),
         "excess_max_drawdown": excess_dd_info["max_drawdown"],
@@ -234,21 +277,27 @@ def calc_trading_metrics(
     turnover: pd.Series | None = None,
     cost: pd.Series | None = None,
     weights: pd.DataFrame | None = None,
-    annual_days: int = 252,
+    annual_days: int | None = None,
+    *,
+    annual_periods: int | None = None,
+    market: str = "stock",
+    timeframe: str = "1d",
 ) -> dict:
     metrics = {}
+    periods = _resolve_periods(annual_days, annual_periods, market, timeframe)
 
     if turnover is not None:
         turnover = turnover.dropna()
         metrics["avg_turnover"] = turnover.mean()
-        metrics["annual_turnover"] = turnover.mean() * annual_days
+        metrics["annual_turnover"] = turnover.mean() * periods
         metrics["total_turnover"] = turnover.sum()
         metrics["rebalance_count"] = (turnover > 0).sum()
 
     if cost is not None:
         cost = cost.dropna()
         metrics["total_cost"] = cost.sum()
-        metrics["avg_daily_cost"] = cost.mean()
+        metrics["avg_period_cost"] = cost.mean()
+        metrics["avg_daily_cost"] = cost.mean()  # legacy key
 
     if weights is not None:
         exposure = weights.abs().sum(axis=1)
@@ -265,16 +314,25 @@ def calc_full_metrics(
     turnover: pd.Series | None = None,
     cost: pd.Series | None = None,
     weights: pd.DataFrame | None = None,
-    annual_days: int = 252,
+    annual_days: int | None = None,
+    *,
+    annual_periods: int | None = None,
+    market: str = "stock",
+    timeframe: str = "1d",
 ) -> dict:
     strategy_returns, benchmark_returns = align_returns(strategy_returns, benchmark_returns)
+    periods = _resolve_periods(annual_days, annual_periods, market, timeframe)
 
-    metrics = {}
-    metrics.update(calc_basic_metrics(strategy_returns, annual_days, prefix="strategy"))
+    metrics = {"annual_periods": periods}
+    metrics.update(calc_basic_metrics(strategy_returns, annual_periods=periods, prefix="strategy"))
 
     if benchmark_returns is not None:
-        metrics.update(calc_benchmark_metrics(strategy_returns, benchmark_returns, annual_days))
+        metrics.update(calc_benchmark_metrics(
+            strategy_returns,
+            benchmark_returns,
+            annual_periods=periods,
+        ))
 
-    metrics.update(calc_trading_metrics(turnover, cost, weights, annual_days))
+    metrics.update(calc_trading_metrics(turnover, cost, weights, annual_periods=periods))
 
     return metrics

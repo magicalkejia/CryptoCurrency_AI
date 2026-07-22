@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 
 import config
+from backtest.annualization import infer_annual_periods
 from crypto.schemas import FrozenConfig, environment_hash, make_audit_id
 from crypto.adapters import to_bars_schema
 from etl.dataset_builder import build_market_dataset, DEFAULT_FEATURE_SET
@@ -61,7 +62,7 @@ from crypto.skills.catalog import (get_feature_row, check_data_quality, detect_r
 from crypto.risk.portfolio import equity_risk_metrics
 from crypto.live.risk_guard import CircuitBreaker
 
-BARS_PER_YEAR_4H = 2190  # 365 * 6
+BARS_PER_YEAR_4H = infer_annual_periods(timeframe="4h", market="crypto")
 
 
 # --------------------------------------------------------------------------- #
@@ -374,7 +375,8 @@ def _run_holdout(md, cut, fcfg, outdir, args):
 
     fee = fcfg.cost.fee_bps / 1e4
     slip = (fcfg.cost.base_slippage_bps + fcfg.cost.spread_proxy_bps) / 1e4
-    cfg = BacktestConfig(fee_rate=fee, slippage_rate=slip, execution_lag=1, annual_days=BARS_PER_YEAR_4H)
+    cfg = BacktestConfig(fee_rate=fee, slippage_rate=slip, execution_lag=1,
+                         annual_periods=BARS_PER_YEAR_4H, market="crypto", timeframe="4h")
 
     def _port(raw_w):   # same LOW-TURNOVER deployment as the dev ladder
         tmp = hold[["symbol", "decision_time"]].copy(); tmp["w"] = raw_w
@@ -429,7 +431,7 @@ def _run_holdout(md, cut, fcfg, outdir, args):
 
         def _full(rseries, turn=None, cost=None):
             r = pd.Series(rseries).dropna()
-            m = calc_full_metrics(r, turnover=turn, cost=cost, annual_days=BARS_PER_YEAR_4H)
+            m = calc_full_metrics(r, turnover=turn, cost=cost, annual_periods=BARS_PER_YEAR_4H)
             eq = (1.0 + r).cumprod()
             return {"ann_return": m.get("strategy_annual_return"),
                     "cum_return": float(eq.iloc[-1] - 1.0) if len(eq) else float("nan"),
@@ -439,8 +441,8 @@ def _run_holdout(md, cut, fcfg, outdir, args):
                     "calmar": m.get("strategy_calmar"), "win_rate": m.get("win_rate"),
                     "profit_loss_ratio": m.get("profit_loss_ratio"),
                     "ann_turnover": m.get("annual_turnover"),
-                    "ann_cost_pct": (m.get("avg_daily_cost") * BARS_PER_YEAR_4H * 100
-                                     if m.get("avg_daily_cost") is not None else None)}
+                    "ann_cost_pct": (m.get("avg_period_cost") * BARS_PER_YEAR_4H * 100
+                                     if m.get("avg_period_cost") is not None else None)}
 
         # Step5: cross-sectional neutral book from the ML alpha
         w5 = _alpha_to_weight_panel(hold, alpha, cp, fcfg, BARS_PER_YEAR_4H,

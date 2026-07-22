@@ -85,7 +85,7 @@ class TradingGraph:
     def run_decision(self, symbol, decision_time, broker, ref_price,
                      cb_level: Optional[int] = None, drawdown: float = 0.0,
                      daily_loss: float = 0.0, rolling_abs_daily_returns=None,
-                     texts=None, llm_fn=None) -> Dict[str, Any]:
+                     texts=None, llm_fn=None, bars_per_year: int = 2190) -> Dict[str, Any]:
         ctx = SkillContext()
         state = new_state(symbol, decision_time)
 
@@ -114,7 +114,7 @@ class TradingGraph:
         self.fusion.run(state, ctx, self.bundle)
 
         # risk (veto authority)
-        self.risk.run(state, ctx, self.fcfg, cb_level=cb_level)
+        self.risk.run(state, ctx, self.fcfg, cb_level=cb_level, bars_per_year=bars_per_year)
 
         # execution stage always runs so it appears in the audit trail/pipeline.
         # ExecutionAgent submits an order only when risk approved a non-zero target;
@@ -165,7 +165,7 @@ class TradingGraph:
             self.signal.run(st, ctx, self.feature_cols)
             self.narr.run(st, ctx, texts=texts_by_symbol.get(sym), llm_fn=llm_fn)
             self.fusion.run(st, ctx, self.bundle)
-            self.risk.run(st, ctx, self.fcfg, cb_level=cb_level)
+            self.risk.run(st, ctx, self.fcfg, cb_level=cb_level, bars_per_year=bars_per_year)
             states[sym] = st
 
         # portfolio overlay across all approved intents (A2)

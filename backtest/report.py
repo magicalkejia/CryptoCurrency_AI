@@ -5,9 +5,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import quantstats as qs
 
+from backtest.annualization import resolve_annual_periods
 from backtest.metrics import calc_max_drawdown_info
+
+
+_QS = None
+_QS_STATS = None
+_QS_ACTIVE_PERIODS_PER_YEAR = 252
 
 
 def _ensure_output_path(output_path):
@@ -34,16 +39,94 @@ def _align_returns(strategy_returns, benchmark_returns=None):
     return strategy_returns, benchmark_returns
 
 
-def print_basic_report(returns, benchmark_returns=None):
+def _load_quantstats():
+    """Import QuantStats only when a QuantStats report is actually requested."""
+    global _QS, _QS_STATS
+    if _QS is None or _QS_STATS is None:
+        import importlib
+
+        _QS = importlib.import_module("quantstats")
+        _QS_STATS = importlib.import_module("quantstats.stats")
+    return _QS, _QS_STATS
+
+
+def _patch_quantstats_annualization(periods_per_year: int, qs_stats=None) -> None:
+    """Force QuantStats CAGR-like metrics to use bar counts, not calendar span.
+
+    Some QuantStats releases annualize CAGR from calendar date span; newer
+    releases fixed ``cagr`` but still call ``rar -> cagr(returns)`` without
+    forwarding ``periods_per_year``.  This patch keeps the HTML report aligned
+    with our engine metrics for both stock daily bars and 24/7 crypto bars.
+    """
+    global _QS_ACTIVE_PERIODS_PER_YEAR
+    _QS_ACTIVE_PERIODS_PER_YEAR = int(periods_per_year)
+    if qs_stats is None:
+        _, qs_stats = _load_quantstats()
+
+    if getattr(qs_stats, "_trading_system_annualization_patch", False):
+        return
+
+    def accurate_cagr(returns, rf=0.0, compounded=True, periods=None):
+        qs_stats.validate_input(returns)
+        periods = int(periods or _QS_ACTIVE_PERIODS_PER_YEAR)
+        if periods <= 0:
+            return np.nan
+
+        prepared = qs_stats._utils._prepare_returns(returns, rf)
+        if len(prepared) == 0:
+            return np.nan
+
+        if compounded:
+            total = qs_stats.comp(prepared)
+        else:
+            total = np.sum(prepared, axis=0)
+
+        years = len(prepared) / periods
+        if years <= 0:
+            return np.nan
+
+        result = (1.0 + total) ** (1.0 / years) - 1.0
+        if isinstance(returns, pd.DataFrame):
+            result = pd.Series(result, index=returns.columns)
+        return result
+
+    def accurate_rar(returns, rf=0.0):
+        prepared = qs_stats._utils._prepare_returns(returns, rf)
+        return accurate_cagr(
+            prepared,
+            rf=0.0,
+            compounded=True,
+            periods=_QS_ACTIVE_PERIODS_PER_YEAR,
+        ) / qs_stats.exposure(prepared)
+
+    qs_stats.cagr = accurate_cagr
+    qs_stats.rar = accurate_rar
+    qs_stats._trading_system_annualization_patch = True
+
+
+def print_basic_report(returns, benchmark_returns=None, periods_per_year: int = 252):
     """
     在 notebook / terminal 中打印 quantstats 基础指标。
     """
     returns, benchmark_returns = _align_returns(returns, benchmark_returns)
+    qs, qs_stats = _load_quantstats()
+    _patch_quantstats_annualization(periods_per_year, qs_stats=qs_stats)
 
     if benchmark_returns is not None:
-        qs.reports.metrics(returns, benchmark=benchmark_returns, mode="basic")
+        qs.reports.metrics(
+            returns,
+            benchmark=benchmark_returns,
+            mode="basic",
+            periods_per_year=periods_per_year,
+            match_dates=False,
+        )
     else:
-        qs.reports.metrics(returns, mode="basic")
+        qs.reports.metrics(
+            returns,
+            mode="basic",
+            periods_per_year=periods_per_year,
+            match_dates=False,
+        )
 
 
 def save_html_report(
@@ -51,6 +134,7 @@ def save_html_report(
     output_path,
     title="Backtest Report",
     benchmark_returns=None,
+    periods_per_year: int = 252,
 ):
     """
     保存 quantstats HTML 报告。
@@ -58,6 +142,8 @@ def save_html_report(
     output_path = _ensure_output_path(output_path)
 
     returns, benchmark_returns = _align_returns(returns, benchmark_returns)
+    qs, qs_stats = _load_quantstats()
+    _patch_quantstats_annualization(periods_per_year, qs_stats=qs_stats)
 
     if benchmark_returns is not None:
         qs.reports.html(
@@ -65,12 +151,16 @@ def save_html_report(
             benchmark=benchmark_returns,
             title=title,
             output=str(output_path),
+            periods_per_year=periods_per_year,
+            match_dates=False,
         )
     else:
         qs.reports.html(
             returns,
             title=title,
             output=str(output_path),
+            periods_per_year=periods_per_year,
+            match_dates=False,
         )
 
     return output_path
@@ -167,32 +257,66 @@ def calc_monthly_returns(returns):
     return table.pivot(index="year", columns="month", values="return")
 
 
-def calc_rolling_sharpe(returns, window=252, annual_days=252):
+def calc_rolling_sharpe(
+    returns,
+    window=None,
+    annual_days=None,
+    *,
+    annual_periods=None,
+    market="stock",
+    timeframe="1d",
+):
     """
     计算滚动夏普。
     """
+    periods = resolve_annual_periods(
+        annual_periods=annual_periods,
+        annual_days=annual_days,
+        market=market,
+        timeframe=timeframe,
+    )
+    if window is None:
+        window = periods
+
     returns = returns.dropna().astype(float)
 
     rolling_mean = returns.rolling(window).mean()
     rolling_std = returns.rolling(window).std()
 
-    return rolling_mean / rolling_std * np.sqrt(annual_days)
+    return rolling_mean / rolling_std * np.sqrt(periods)
 
 
-def plot_rolling_sharpe(returns, window=252, annual_days=252, output_path=None):
+def plot_rolling_sharpe(
+    returns,
+    window=None,
+    annual_days=None,
+    output_path=None,
+    *,
+    annual_periods=None,
+    market="stock",
+    timeframe="1d",
+):
     """
     绘制滚动夏普。
     """
     output_path = _ensure_output_path(output_path)
+    periods = resolve_annual_periods(
+        annual_periods=annual_periods,
+        annual_days=annual_days,
+        market=market,
+        timeframe=timeframe,
+    )
+    if window is None:
+        window = periods
 
     rolling_sharpe = calc_rolling_sharpe(
         returns,
         window=window,
-        annual_days=annual_days,
+        annual_periods=periods,
     )
 
     plt.figure(figsize=(12, 4))
-    plt.plot(rolling_sharpe.index, rolling_sharpe, label=f"Rolling Sharpe ({window}D)")
+    plt.plot(rolling_sharpe.index, rolling_sharpe, label=f"Rolling Sharpe ({window} bars)")
     plt.axhline(0, linewidth=1)
     plt.title("Rolling Sharpe")
     plt.xlabel("Date")
