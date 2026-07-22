@@ -39,7 +39,7 @@ class CircuitBreakerState:
 
 class CircuitBreaker:
     def __init__(self, recover_periods: int = 5, reduced_pos_mult: float = 0.5,
-                 dd_l1: float = 0.10, dd_l2: float = 0.15, dd_l3: float = 0.20):
+                 dd_l1: float = 0.20, dd_l2: float = 0.25, dd_l3: float = 0.30):
         self.state = CircuitBreakerState()
         self.recover_periods = recover_periods   # N=5 (~20h) default, simp #2
         self.reduced_pos_mult = reduced_pos_mult
@@ -110,7 +110,7 @@ class CircuitBreaker:
 
     @staticmethod
     def _reason(dd, dl, soft, hard, conn, recon, kill,
-                dd_l1: float = 0.10, dd_l2: float = 0.15, dd_l3: float = 0.20):
+                dd_l1: float = 0.20, dd_l2: float = 0.25, dd_l3: float = 0.30):
         parts = []
         if not conn:
             parts.append("connection_anomaly")

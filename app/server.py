@@ -36,13 +36,13 @@ AGENT_DATA = os.environ.get("AGENT_DATA", "synthetic")
 SYMBOLS_REAL = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
                 "DOGE/USDT", "LTC/USDT", "LINK/USDT", "TRX/USDT", "ADA/USDT"]
 AGENTS = [
-    ("DataAgent", "拉取特征 + PIT/数据质量检查", "data"),
-    ("SignalResearchAgent", "结构化模型 + PatchTST 预测", "signal"),
-    ("NarrativeAgent", "LLM 事件/叙事 -> 结构化因子", "narrative"),
-    ("FusionAgent", "Regime + 多模态融合 + 元模型 + 校准", "fusion"),
-    ("RiskAgent", "波动率目标/仓位/熔断 —— 拥有最高否决权", "risk"),
-    ("ExecutionAgent", "订单计划 + 成交(纸交易)", "execution"),
-    ("ReviewAgent", "复盘/审计摘要", "review"),
+    ("DataAgent", "Fetch features + PIT/data-quality checks", "data"),
+    ("SignalResearchAgent", "Structured model + PatchTST forecasts", "signal"),
+    ("NarrativeAgent", "LLM events/narrative -> structured factors", "narrative"),
+    ("FusionAgent", "Regime + multi-modal fusion + meta model + calibration", "fusion"),
+    ("RiskAgent", "Vol target / sizing / breaker — holds supreme veto", "risk"),
+    ("ExecutionAgent", "Order plan + fills (paper trading)", "execution"),
+    ("ReviewAgent", "Review / audit summary", "review"),
 ]
 
 def _find_exp_dir():
@@ -91,7 +91,7 @@ def _parse_governance(console_path):
 
 def _load_results(exp_dir):
     if not exp_dir:
-        return {"ok": False, "msg": "未找到实验输出目录。请用 EXP_DIR 环境变量指向 data_storage/experiments/<时间戳> 目录。"}
+        return {"ok": False, "msg": "Experiment output directory not found. Set the EXP_DIR environment variable to a data_storage/experiments/<timestamp> directory."}
     return {"ok": True, "exp_dir": exp_dir,
             "real_returns": _read_json(os.path.join(exp_dir, "real_returns_table.json")),
             "ladder": _read_ladder_csv(os.path.join(exp_dir, "incremental_ladder.csv")),
@@ -141,7 +141,7 @@ def get_graph():
 PAGE = r"""
 <!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>多模态 Agent 加密量化 · 演示控制台</title>
+<title>Multi-Modal Agent Crypto Quant · Demo Console</title>
 <style>
  :root{--bg:#0f1117;--panel:#161a23;--line:#232838;--muted:#8b93a7;--fg:#e6e6e6;
        --green:#36d399;--red:#f87272;--amber:#fbbd23;--blue:#60a5fa;--dim:#3a4151}
@@ -190,32 +190,47 @@ PAGE = r"""
  code{color:var(--amber)} a{color:var(--blue)} ol{padding-left:18px}
 </style></head><body>
 <header>
-  <h1>多模态 Agent 加密量化 <span class="muted">· 演示控制台</span></h1>
+  <h1>Multi-Modal Agent Crypto Quant <span class="muted">· Demo Console</span></h1>
   <div class="tabs">
-    <div class="tab active" data-v="results">实验结果仪表盘</div>
-    <div class="tab" data-v="live">实时 Agent 决策</div>
+    <div class="tab active" data-v="results">Results Dashboard</div>
+    <div class="tab" data-v="live">Live Agent Decision</div>
+    <div class="tab" data-v="arch">Agent Architecture</div>
   </div>
 </header>
 <main>
-<section class="view active" id="v-results"><div id="results-root"><div class="card muted">加载中…</div></div></section>
+<section class="view active" id="v-results"><div id="results-root"><div class="card muted">Loading…</div></div></section>
 <section class="view" id="v-live">
   <div class="card">
-    <h2>实时 Agent 决策（数据源：<span id="dmode" class="muted">…</span>）</h2>
+    <h2>Live Agent Decision (data source: <span id="dmode" class="muted">…</span>)</h2>
     <div class="row">
       <select id="sym"></select>
-      <label class="small">熔断注入(what-if)：</label>
-      <select id="cb"><option value="auto">真实熔断(按数据)</option><option value="0" selected>L0 正常</option><option value="1">L1 警告</option>
-        <option value="2">L2 降仓</option><option value="3">L3 暂停(触发否决)</option></select>
-      <button onclick="decide()">运行一次决策</button>
-      <button onclick="resetPos()">重置持仓</button>
+      <label class="small">Breaker injection (what-if):</label>
+      <select id="cb"><option value="auto">Real breaker (from data)</option><option value="0" selected>L0 normal</option><option value="1">L1 warn</option>
+        <option value="2">L2 delever</option><option value="3">L3 halt (veto)</option></select>
+      <button onclick="decide()">Run one decision</button>
+      <button onclick="resetPos()">Reset positions</button>
     </div>
-    <p class="small">点击后，下方 Agent 流水线会按本次决策<b style="color:var(--blue)">实际经过的路径</b>依次点亮：<span style="color:var(--green)">绿=执行</span>，<span style="color:var(--red)">红=Risk 否决/停止</span>，灰=未到达。</p>
-    <p class="small">演示真实熔断（合成数据模式）：熔断注入选「真实熔断(按数据)」，标的选 <code>SOL/USDT</code>→L1 警告、<code>DOGE/USDT</code>→L2 降仓、<code>XRP/USDT</code>→L3 暂停否决；其余币为正常。</p>
+    <p class="small">After you click, the pipeline below lights up along the <b style="color:var(--blue)">path this decision actually took</b>: <span style="color:var(--green)">green = executed</span>, <span style="color:var(--red)">red = risk veto / stop</span>, grey = not reached.</p>
+    <p class="small">Demoing a real breaker (synthetic mode): set injection to "Real breaker (from data)" and pick <code>SOL/USDT</code>→L1 warn (>20%), <code>DOGE/USDT</code>→L2 delever (>25%), <code>XRP/USDT</code>→L3 halt/veto (>30%); all other coins are normal.</p>
   </div>
   <div class="grid g3">
-    <div class="card" style="grid-column:span 1"><h2>Agent 流水线</h2><div class="pipe" id="pipe"></div></div>
-    <div class="card" style="grid-column:span 2"><h2>本次决策</h2>
+    <div class="card" style="grid-column:span 1"><h2>Agent Pipeline</h2><div class="pipe" id="pipe"></div></div>
+    <div class="card" style="grid-column:span 2"><h2>This Decision</h2>
       <div class="grid g4" id="dkpi"></div><pre id="djson" style="margin-top:12px">—</pre></div>
+  </div>
+</section>
+<section class="view" id="v-arch">
+  <div class="card">
+    <h2>Agent architecture — execution order, inputs and outputs</h2>
+    <div class="row" style="margin-bottom:12px">
+      <button id="archPlay">▶ Play</button>
+      <button id="archPrev">‹ Prev</button>
+      <button id="archNext">Next ›</button>
+    </div>
+    <div style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap">
+      <div id="archPipe" style="width:250px;flex:0 0 auto"></div>
+      <div id="archDetail" style="flex:1;min-width:300px"></div>
+    </div>
   </div>
 </section>
 </main>
@@ -227,84 +242,107 @@ $$(".tab").forEach(t=>t.onclick=()=>{$$(".tab").forEach(x=>x.classList.remove("a
 const fmtPct=x=>(x==null||isNaN(x))?"—":(x*100).toFixed(1)+"%";
 const fmtN=x=>(x==null||isNaN(x))?"—":(+x).toFixed(2);
 const cls=x=>x>=0?"pos":"neg";
+const STRAT={
+ "Step0_TSMOM (benchmark)":"Momentum benchmark (TSMOM)",
+ "Step5_fusion (pure signal)":"ML multi-modal signal (pure, no risk stack)",
+ "Step7 + circuit-breaker (deliverable+risk)":"Main deliverable + circuit breaker",
+ "Step7 + directional stack (full risk)":"Main deliverable + full directional risk stack",
+ "Step7_tsmom_fusion (MAIN deliverable)":"MAIN deliverable \u00b7 ML + momentum fusion",
+ "decision_stack (risk+port+CB)":"ML signal + neutral risk stack (with breaker)",
+ "decision_stack(risk+port+CB)":"ML signal + neutral risk stack (with breaker)",
+ "decision_stack_noCB (risk+port)":"ML signal + neutral risk stack (no breaker)",
+ "Step6_meta_gate (signal+gate)":"ML signal + meta-gate (harmful \u2014 kept honest)",
+ "Step5 + neutral decision stack":"ML signal + neutral risk stack"};
+const LSTEP={
+ "Step0_baseline_tsmom":"Step0 \u00b7 TSMOM baseline",
+ "Step1_market":"Step1 \u00b7 market",
+ "Step1b_+xsmom":"Step1b \u00b7 market+xsmom",
+ "Step2_+onchain":"Step2 \u00b7 market+onchain (diagnostic branch)",
+ "Step3_+narrative":"Step3 \u00b7 market+narrative",
+ "Step3b_+event":"Step3b \u00b7 market+narrative+event",
+ "Step4_+patchtst":"Step4 \u00b7 market+narrative+event+patchtst",
+ "Step5_fusion":"Step5 \u00b7 skill-weighted fusion",
+ "Step6_meta_gate":"Step6 \u00b7 fusion+meta-gate (branch)",
+ "Step7_tsmom_fusion":"Step7 \u00b7 fusion+TSMOM (MAIN)",
+ "Step8_onchain_overlay":"Step8 \u00b7 on-chain overlay (branch)",
+ "Step3c_event_overlay":"Step3c \u00b7 event overlay (branch)",
+ "Step3d_event_risk_gate":"Step3d \u00b7 news-risk gate (branch)"};
+const dName=k=>STRAT[k]||k, lName=k=>LSTEP[k]||k;
+const DEV_SPAN="Feb 2021 \u2013 16 May 2025", HO_SPAN="16 May 2025 \u2013 12 Jun 2026";
 async function loadResults(){
   const r=await fetch("/api/results").then(r=>r.json());const root=$("#results-root");
-  if(!r.ok){root.innerHTML=`<div class="card"><h2>实验结果</h2><p class="muted">${r.msg}</p></div>`;return;}
+  if(!r.ok){root.innerHTML=`<div class="card"><h2>Results</h2><p class="muted">${r.msg}</p></div>`;return;}
   let h="";const rr=r.real_returns||{};const k=rr["Step7_tsmom_fusion (MAIN deliverable)"];
-  if(k){h+=`<div class="card"><h2>主交付 Step7（ML+TSMOM 融合）· 开发期真实表现</h2><div class="grid g4">
-      <div class="kpi"><div class="v ${cls(k.ann_return)}">${fmtPct(k.ann_return)}</div><div class="l">年化收益</div></div>
-      <div class="kpi"><div class="v ${cls(k.cum_return)}">${fmtPct(k.cum_return)}</div><div class="l">累计收益</div></div>
-      <div class="kpi"><div class="v">${fmtPct(k.max_drawdown)}</div><div class="l">最大回撤</div></div>
+  if(k){h+=`<div class="card"><h2>Main Deliverable (ML + Momentum Fusion) \u00b7 Development Period: ${DEV_SPAN}</h2><div class="grid g4">
+      <div class="kpi"><div class="v ${cls(k.ann_return)}">${fmtPct(k.ann_return)}</div><div class="l">Annual return</div></div>
+      <div class="kpi"><div class="v ${cls(k.cum_return)}">${fmtPct(k.cum_return)}</div><div class="l">Cumulative return</div></div>
+      <div class="kpi"><div class="v">${fmtPct(k.max_drawdown)}</div><div class="l">Max drawdown</div></div>
       <div class="kpi"><div class="v">${fmtN(k.sharpe)}</div><div class="l">Sharpe</div></div>
-    </div><p class="small">实验目录：<code>${r.exp_dir}</code></p></div>`;}
-  if(Object.keys(rr).length){h+=`<div class="card"><h2>真实收益率对照表</h2><table><thead><tr>
-      <th>策略</th><th>年化</th><th>累计</th><th>最大回撤</th><th>Sharpe</th></tr></thead><tbody>`;
+    </div><p class="small">Experiment dir: <code>${r.exp_dir}</code></p></div>`;}
+  if(Object.keys(rr).length){h+=`<div class="card"><h2>Real-Returns Comparison \u00b7 development period, net of costs</h2><table><thead><tr>
+      <th>Strategy</th><th>Annual</th><th>Cumulative</th><th>Max DD</th><th>Sharpe</th></tr></thead><tbody>`;
     for(const [name,s] of Object.entries(rr)){const hi=name.includes("MAIN")?"hi":"";
-      h+=`<tr class="${hi}"><td>${name}</td><td class="${cls(s.ann_return)}">${fmtPct(s.ann_return)}</td>
+      h+=`<tr class="${hi}"><td>${dName(name)}</td><td class="${cls(s.ann_return)}">${fmtPct(s.ann_return)}</td>
         <td class="${cls(s.cum_return)}">${fmtPct(s.cum_return)}</td><td>${fmtPct(s.max_drawdown)}</td><td>${fmtN(s.sharpe)}</td></tr>`;}
     h+=`</tbody></table></div>`;}
-  if(r.ladder&&r.ladder.length){h+=`<div class="card"><h2>增量证明阶梯（每个模态是否带来显著增量）</h2>
-      <p class="small">incr_NW_t &gt; 2 视为显著增量；诚实地，多数另类模态在本框架下无显著增量——这是结论而非缺陷。</p>
-      <table><thead><tr><th>步骤</th><th>Sharpe</th><th>DSR</th><th>incr_t(vs上一步)</th><th>incr_t(vs TSMOM)</th></tr></thead><tbody>`;
+  if(r.ladder&&r.ladder.length){h+=`<div class="card"><h2>Incremental Proof Ladder \u2014 does each modality add a significant increment?</h2>
+      <p class="small">Main-chain rows are cumulative (each adds one modality to the previous main-chain row); branch rows are diagnostics off the chain. incr_NW_t &gt; 2 marks a significant increment \u2014 honestly, most alternative-data modalities show none, a finding rather than a defect.</p>
+      <table><thead><tr><th>Stage</th><th>Sharpe</th><th>DSR</th><th>incr_t (vs prev main-chain)</th><th>incr_t (vs TSMOM)</th></tr></thead><tbody>`;
     for(const row of r.ladder){const step=row.step||row[""]||Object.values(row)[0]||"";
       const it=row.incr_NW_t,ib=row.incr_NW_t_base;const sig=(Math.abs(+it)>2)?"hi":"";
-      h+=`<tr class="${sig}"><td>${step}</td><td>${fmtN(row.sharpe_ann)}</td><td>${fmtN(row.deflated_sharpe)}</td>
+      h+=`<tr class="${sig}"><td>${lName(step)}</td><td>${fmtN(row.sharpe_ann)}</td><td>${fmtN(row.deflated_sharpe)}</td>
         <td>${fmtN(it)}</td><td>${fmtN(ib)}</td></tr>`;}
     h+=`</tbody></table></div>`;}
   const dv=r.decision_vs_signal&&r.decision_vs_signal.metrics;
-  if(dv){h+=`<div class="card"><h2>决策栈 vs 纯信号（风控的价值：回撤控制）</h2>
-      <table><thead><tr><th>策略</th><th>Sharpe</th><th>年化</th><th>最大回撤</th></tr></thead><tbody>`;
-    for(const [name,s] of Object.entries(dv)){h+=`<tr><td>${name}</td><td>${fmtN(s.sharpe)}</td>
+  if(dv){h+=`<div class="card"><h2>Risk Stack vs Pure Signal \u2014 what risk control buys: drawdown</h2>
+      <table><thead><tr><th>Strategy</th><th>Sharpe</th><th>Annual</th><th>Max DD</th></tr></thead><tbody>`;
+    for(const [name,s] of Object.entries(dv)){h+=`<tr><td>${dName(name)}</td><td>${fmtN(s.sharpe)}</td>
         <td class="${cls(s.ann_return)}">${fmtPct(s.ann_return)}</td><td>${fmtPct(s.max_drawdown)}</td></tr>`;}
     h+=`</tbody></table></div>`;}
-  // two paradigms x matched risk: Step5 neutral stack vs Step7 directional stack
   const ds=r.decision_stack||{}, dir=(r.directional_stack&&r.directional_stack.metrics)||null;
   if(dir){
     const n_sh=ds.strategy_sharpe, n_ar=ds.strategy_annual_return, n_dd=ds.strategy_max_drawdown;
     const d_sh=dir.strategy_sharpe, d_ar=dir.strategy_annual_return, d_dd=dir.strategy_max_drawdown;
     const di=(r.directional_stack.info)||{};
-    h+=`<div class="card"><h2>两种策略范式 × 各自适配的风控（完整链路对照）</h2>
-      <table><thead><tr><th>链路</th><th>信号</th><th>风控范式</th><th>Sharpe</th><th>年化</th><th>最大回撤</th></tr></thead><tbody>
-      <tr><td>Step5 + 中性决策栈</td><td>横截面中性(选币)</td><td>相关性haircut/簇上限/熔断</td>
+    h+=`<div class="card"><h2>Two Strategy Paradigms \u00d7 Matched Risk Control</h2>
+      <table><thead><tr><th>Pipeline</th><th>Signal</th><th>Risk paradigm</th><th>Sharpe</th><th>Annual</th><th>Max DD</th></tr></thead><tbody>
+      <tr><td>Neutral book + neutral risk stack</td><td>Cross-sectional coin selection</td><td>Correlation haircut \u00b7 cluster cap \u00b7 breaker</td>
         <td>${fmtN(n_sh)}</td><td class="${cls(n_ar)}">${fmtPct(n_ar)}</td><td>${fmtPct(n_dd)}</td></tr>
-      <tr class="hi"><td>Step7 + 方向性决策栈</td><td>ML+TSMOM(方向)</td><td>净暴露上限/总波动目标/熔断</td>
+      <tr class="hi"><td>Directional book + directional risk stack</td><td>ML + momentum (directional)</td><td>Net-exposure cap \u00b7 vol target \u00b7 breaker</td>
         <td>${fmtN(d_sh)}</td><td class="${cls(d_ar)}">${fmtPct(d_ar)}</td><td>${fmtPct(d_dd)}</td></tr>
       </tbody></table>
-      <p class="small">中性 book 用中性风控（多空对冲、相关性中性化）；方向 book 用方向风控（净暴露/总波动目标）。
-        Step7 方向栈保留净暴露 avg|net|=<code>${fmtN(di.avg_abs_net_exposure)}</code>（上限 ${fmtN(di.net_exposure_cap)}），
-        这正是 TSMOM 的方向性 alpha 来源——若误用中性 overlay 会把它中和掉。两条链路都可实盘。</p></div>`;
+      <p class="small">The neutral book uses neutral risk control (long/short hedged, correlation-neutralized); the directional book uses directional risk control (net-exposure cap, portfolio vol target). The directional stack keeps avg |net exposure| = <code>${fmtN(di.avg_abs_net_exposure)}</code> (cap ${fmtN(di.net_exposure_cap)}) \u2014 exactly where the momentum alpha lives; a neutral overlay would cancel it. Both pipelines are production-ready.</p></div>`;
   }
   const g=r.governance||{};
-  // holdout sample-out full table (the confirmatory result — the report's centerpiece)
   const ho=r.holdout||null;
   if(ho){
     const order=["Step5_fusion (pure signal)","Step7_tsmom_fusion (MAIN deliverable)",
       "Step5 + neutral decision stack","Step7 + directional stack (full risk)","Step0_TSMOM (benchmark)"];
-    h+=`<div class="card" style="border:2px solid var(--blue)"><h2>样本外最终检验 Holdout-A（冻结配置，与 dev 同口径）</h2>
-      <p class="small">这是消耗一次的确认性检验——真正证明交付物质量的部分。</p>
-      <table><thead><tr><th>策略</th><th>年化</th><th>累计</th><th>波动</th><th>最大回撤</th><th>Sharpe</th><th>Sortino</th><th>Calmar</th><th>换手</th><th>胜率</th></tr></thead><tbody>`;
+    h+=`<div class="card" style="border:2px solid var(--blue)"><h2>Out-of-Sample Final Test \u00b7 frozen config \u00b7 ${HO_SPAN}</h2>
+      <p class="small">A once-only confirmatory test on untouched data, same conventions as development \u2014 the part that actually proves deliverable quality.</p>
+      <table><thead><tr><th>Strategy</th><th>Annual</th><th>Cumulative</th><th>Vol</th><th>Max DD</th><th>Sharpe</th><th>Sortino</th><th>Calmar</th><th>Turnover</th><th>Win rate</th></tr></thead><tbody>`;
     for(const nm of order){ const s=ho[nm]; if(!s) continue;
       const hi=nm.includes("MAIN")?"hi":"";
-      h+=`<tr class="${hi}"><td>${nm}</td><td class="${cls(s.ann_return)}">${fmtPct(s.ann_return)}</td>
+      h+=`<tr class="${hi}"><td>${dName(nm)}</td><td class="${cls(s.ann_return)}">${fmtPct(s.ann_return)}</td>
         <td class="${cls(s.cum_return)}">${fmtPct(s.cum_return)}</td><td>${fmtPct(s.ann_vol)}</td>
         <td>${fmtPct(s.max_drawdown)}</td><td>${fmtN(s.sharpe)}</td><td>${fmtN(s.sortino)}</td>
-        <td>${fmtN(s.calmar)}</td><td>${s.ann_turnover!=null?Math.round(s.ann_turnover):'—'}</td>
+        <td>${fmtN(s.calmar)}</td><td>${s.ann_turnover!=null?Math.round(s.ann_turnover):'\u2014'}</td>
         <td>${fmtPct(s.win_rate)}</td></tr>`;}
     h+=`</tbody></table></div>`;
   }
   if(Object.keys(g).length){
-    const pit=g.pit_passed?`<span class="pill ok">通过 · 0 泄露</span>`:`<span class="pill bad">未通过</span>`;
-    const ece=g.ece_calibrated!=null?`<span class="pill ${g.ece_calibrated<0.05?'ok':'warn'}">ECE ${g.ece_calibrated.toFixed(4)}</span>`:"—";
-    const pbo=g.pbo!=null?`<span class="pill ${g.pbo<0.5?'ok':'warn'}">PBO ${g.pbo.toFixed(3)}</span>`:"—";
-    h+=`<div class="card"><h2>治理三闸门（结果可信度）</h2><div class="grid g3">
-      <div class="kpi"><div class="v">${pit}</div><div class="l">PIT 时点正确性（无未来泄露）</div></div>
-      <div class="kpi"><div class="v">${ece}</div><div class="l">概率校准误差（&lt;0.05 良好）</div></div>
-      <div class="kpi"><div class="v">${pbo}</div><div class="l">回测过拟合概率（&lt;0.5 良好）</div></div></div>`;
-    if(g.event_cm_t!=null||g.event_vol_t!=null){h+=`<p class="small" style="margin-top:12px">新闻/事件因子诚实检验：
-      横截面 t=<code>${fmtN(g.event_xs_t)}</code>、共模 t=<code>${fmtN(g.event_cm_t)}</code>、波动预测 t=<code>${fmtN(g.event_vol_t)}</code>
-      —— 信号集中在共模(市场级)维度但不足以转化为可交易增量，四种部署方式均经检验。</p>`;}
+    const pit=g.pit_passed?`<span class="pill ok">PASS \u00b7 0 leaks</span>`:`<span class="pill bad">FAILED</span>`;
+    const ece=g.ece_calibrated!=null?`<span class="pill ${g.ece_calibrated<0.05?'ok':'warn'}">ECE ${g.ece_calibrated.toFixed(4)}</span>`:"\u2014";
+    const pbo=g.pbo!=null?`<span class="pill ${g.pbo<0.5?'ok':'warn'}">PBO ${g.pbo.toFixed(3)}</span>`:"\u2014";
+    h+=`<div class="card"><h2>Three Governance Gates \u00b7 result credibility</h2><div class="grid g3">
+      <div class="kpi"><div class="v">${pit}</div><div class="l">Point-in-time correctness (no look-ahead)</div></div>
+      <div class="kpi"><div class="v">${ece}</div><div class="l">Probability calibration error (&lt;0.05 good)</div></div>
+      <div class="kpi"><div class="v">${pbo}</div><div class="l">Probability of backtest overfitting (&lt;0.5 good)</div></div></div>`;
+    if(g.event_cm_t!=null||g.event_vol_t!=null){h+=`<p class="small" style="margin-top:12px">Honest news/event tests:
+      cross-sectional t=<code>${fmtN(g.event_xs_t)}</code>, common-mode t=<code>${fmtN(g.event_cm_t)}</code>, volatility-forecast t=<code>${fmtN(g.event_vol_t)}</code>
+      \u2014 the signal concentrates in the common-mode (market-level) dimension but is not tradeable as an increment; four deployments were tested.</p>`;}
     h+=`</div>`;}
-  root.innerHTML=h||`<div class="card muted">实验目录已找到，但未解析到可展示文件。</div>`;
+  root.innerHTML=h||`<div class="card muted">Experiment directory found, but no displayable files were parsed.</div>`;
 }
 let _liveReady=false, _liveLoading=false;
 const FALLBACK_SYMS=["BTC/USDT","ETH/USDT","SOL/USDT","BNB/USDT","XRP/USDT","DOGE/USDT","LTC/USDT","LINK/USDT","TRX/USDT","ADA/USDT"];
@@ -313,7 +351,7 @@ async function initLive(){
   if(_liveReady||_liveLoading) return;
   _liveLoading=true;
   console.log("[live] initLive: fetching /api/agents ...");
-  $("#dmode").textContent="加载模型图中…（首次较慢，正在载入真实数据，请看后端控制台进度）";
+  $("#dmode").textContent="Building the model graph… (first call is slow — loading real data; see the backend console for progress)";
   // Pre-fill the dropdown immediately so the UI is usable even while the graph builds.
   fillSymbols(FALLBACK_SYMS);
   const ctrl=new AbortController();
@@ -335,10 +373,10 @@ async function initLive(){
   }catch(e){
     clearTimeout(timer);
     console.error("[live] initLive failed:",e);
-    const msg=(e.name==="AbortError")?"加载超时（>6分钟）。真实数据/模型构建过慢，请看后端控制台。":("加载失败："+e.message);
-    $("#dmode").innerHTML=`<span style="color:var(--red)">${msg}</span> <a href="#" onclick="_liveReady=false;_liveLoading=false;initLive();return false;">点此重试</a>`;
+    const msg=(e.name==="AbortError")?"Timed out (>6 min). The real-data/model build is too slow — check the backend console.":("Load failed: "+e.message);
+    $("#dmode").innerHTML=`<span style="color:var(--red)">${msg}</span> <a href="#" onclick="_liveReady=false;_liveLoading=false;initLive();return false;">retry</a>`;
     // keep the fallback dropdown so the user can still try a decision
-    renderPipe([{agent:"(graph unavailable)",role:"后端构图失败，下拉框已用默认10币占位",category:"data"}],null);
+    renderPipe([{agent:"(graph unavailable)",role:"Backend graph build failed; the dropdown is pre-filled with the default 10 symbols",category:"data"}],null);
   }finally{ _liveLoading=false; }
 }
 function pipeNodeHTML(a,st){
@@ -373,17 +411,17 @@ async function animatePipe(agents,path,onRisk){
 function cbClass(lvl){ lvl=+lvl||0; return lvl>=3?"alert":(lvl>=1?"warn":""); }
 function riskClass(rl){ return (rl==="blocked")?"alert":(rl==="medium"?"":""); }
 async function decide(){
-  if(!_liveReady){await initLive(); if(!_liveReady){alert("Agent 图尚未就绪，请查看后端日志。");return;}}
+  if(!_liveReady){await initLive(); if(!_liveReady){alert("Agent graph not ready — check the backend log.");return;}}
   const sym=$("#sym").value,cbRaw=$("#cb").value,cb=(cbRaw==="auto"?0:+cbRaw),cbAuto=(cbRaw==="auto");
-  if(!sym){alert("请先选择交易标的");return;}
+  if(!sym){alert("Pick a symbol first");return;}
   // clear right panel while the pipeline runs, so it doesn't pre-empt the animation
-  $("#djson").textContent="决策中…";
+  $("#djson").textContent="Deciding…";
   $("#dkpi").innerHTML="";
   let r;
   try{
     r=await fetch("/api/decide",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({symbol:sym,cb_level:cbRaw})}).then(r=>r.json());
-  }catch(e){$("#djson").textContent="请求失败："+e.message;return;}
+  }catch(e){$("#djson").textContent="Request failed: "+e.message;return;}
   if(r.error){alert(r.error);$("#djson").textContent=r.error;return;}const d=r.decision||{};
   const ran=(r.audit_log||[]).map(x=>x.category);
   const cbReal=+(d.circuit_breaker_level||0);
@@ -395,11 +433,11 @@ async function decide(){
   const reveal=()=>{
     const cbc=cbClass(d.circuit_breaker_level), rkc=riskClass(d.risk_level);
     const kpis=[
-      ["方向",d.primary_direction||d.action||"—",""],
-      ["目标仓位",d.target_position!=null?(+d.target_position).toFixed(3):"—",""],
-      ["熔断级别","L"+(+d.circuit_breaker_level||0),cbc],
-      ["风险级别",d.risk_level||"—",rkc],
-      ["实测回撤",r.real_drawdown!=null?(r.real_drawdown*100).toFixed(1)+"%":"—",cbc]
+      ["Direction",d.primary_direction||d.action||"—",""],
+      ["Target position",d.target_position!=null?(+d.target_position).toFixed(3):"—",""],
+      ["Breaker level","L"+(+d.circuit_breaker_level||0),cbc],
+      ["Risk level",d.risk_level||"—",rkc],
+      ["Realized drawdown",r.real_drawdown!=null?(r.real_drawdown*100).toFixed(1)+"%":"—",cbc]
     ];
     $("#dkpi").innerHTML=kpis.map(([l,v,c])=>`<div class="kpi ${c}"><div class="v" style="font-size:16px">${v}</div><div class="l">${l}</div></div>`).join("");
     $("#djson").textContent=JSON.stringify(d,null,2);
@@ -407,7 +445,123 @@ async function decide(){
   await animatePipe(a.agents,{ran,veto,cbWarn},reveal);
   reveal();  // safety: ensure it's shown even if risk node was absent
 }
-async function resetPos(){await fetch("/api/reset_positions",{method:"POST"});alert("持仓已重置");}
+async function resetPos(){await fetch("/api/reset_positions",{method:"POST"});alert("Positions reset");}
+/* ---------------- Agent architecture tab (presentation animation) -------- */
+(function(){
+  var A=[
+    {name:"Data agent",skills:"get_feature_row \u00b7 check_data_quality",
+     input:[["2 fields","symbol + decision time"]],
+     output:[["45 features","1 point-in-time feature row:<br>\u2022 27 market \u2014 multi-horizon returns, volatility, ATR, range, RSI, momentum, funding<br>\u2022 6 on-chain \u2014 z-scores + growth rates<br>\u2022 12 PatchTST \u2014 4 horizon forecasts + 8-dim embedding"],
+             ["1 score","data_quality_score in [0, 1] \u2014 1 \u2212 missing/45, forced to 0 on any PIT violation"]],
+     ex:[["call","get_feature_row('DOGE/USDT', 2026-06-12 04:01)"],
+         ["row excerpt","ret_4h \u22121.2% \u00b7 vol_24h 3.1% \u00b7 RSI 34 \u00b7 funding \u22120.010% \u00b7 onchain_z \u22120.8 \u00b7 patchtst_forecast_4h +0.0004"],
+         ["quality","45/45 features present, availability_ts \u2264 decision time \u2192 data_quality_score = 1.0"]]},
+    {name:"Signal research agent",skills:"signal_infer",
+     input:[["45 features","the feature row from the data agent + the feature column list"]],
+     output:[["4 channels","base_model_pred: the PatchTST forecasts for 4h, 12h, 24h, 3d"],
+             ["1 entry","audit-log record (category: signal)"]],
+     ex:[["surfaces","patchtst_forecast_4h +0.0004 \u00b7 12h +0.0007 \u00b7 24h +0.0007 \u00b7 3d +0.0024"],
+         ["audit","signal_infer logged: category=signal, ok=true, 0.4 ms"]]},
+    {name:"Narrative agent",skills:"narrative_infer",
+     input:[["factors","this symbol's news/event factors at the decision time \u2014 produced upstream by CryptoBERT (sentiment over 34,284 articles) and DeepSeek LLM (63,007 structured events)"]],
+     output:[["4 fields","sentiment \u00b7 severity \u00b7 event type \u00b7 stub flag \u2014 structured factors only, never a trade direction"]],
+     ex:[["factors","sentiment \u22120.2 \u00b7 severity low \u00b7 event_type none \u00b7 narrative_stub = true (offline mode)"],
+         ["meaning","no fresh DOGE news at this timestamp \u2192 the narrative alpha stays neutral"]]},
+    {name:"Fusion agent",skills:"detect_regime \u00b7 fusion_infer \u00b7 compute_confidence",
+     input:[["45 features","the feature row"],
+            ["narrative","the narrative agent's factors"],
+            ["1 bundle","the frozen LightGBM two-stage bundle, trained offline, config hash locked"]],
+     proc:[["LightGBM","this is where LightGBM actually runs \u2014 stage 1: 3-class triple-barrier classifier on the 45 features \u2192 market alpha = p(up) \u2212 p(down); stage 2: meta-label + Platt calibration (ECE 0.0056) \u2192 the calibrated trade probability used for sizing"],
+           ["fusion","the market alpha is skill-weight fused with the narrative/event alphas (weights earned from data: market 0.86 \u00b7 narrative 0.08 \u00b7 event 0.06) + regime detection"]],
+     output:[["5 fields","combined_alpha \u00b7 primary_direction (long / short / flat) \u00b7 meta_trade_prob_calibrated \u00b7 regime \u00b7 confidence"]],
+     ex:[["bundle.predict","p(down)=0.62 \u00b7 p(flat)=0.10 \u00b7 p(up)=0.28 \u2192 market alpha = 0.28 \u2212 0.62 = \u22120.34"],
+         ["fuse + calibrate","combined_alpha \u22120.99 (z-scored) \u00b7 meta_trade_prob 0.92 \u00b7 regime trending_down \u00b7 confidence 0.78"],
+         ["read","strongly bearish with high conviction \u2192 propose SHORT"]]},
+    {name:"Risk agent",skills:"compute_circuit_breaker \u00b7 risk_size_and_gate",veto:1,
+     input:[["5 fields","all fusion outputs"],
+            ["from row","ATR + volatility for sizing"],
+            ["1 value","trailing drawdown (or an injected what-if breaker level)"]],
+     output:[["7 fields","target_position (signed: + long / \u2212 short) \u00b7 risk_level \u00b7 circuit_breaker_level (L0\u2013L3) \u00b7 risk_approved \u00b7 stop_loss \u00b7 take_profit \u00b7 vol_target_scalar"],
+             ["in place","L2 halves the position, L3 zeroes it \u2014 the reduced position flows forward, control never loops back"]],
+     ex:[["sizing","conviction \u00d7 vol target \u2192 \u22120.25 (a short at the 25% per-symbol cap)"],
+         ["breaker","trailing 90-day drawdown 17.6% > 15% \u2192 L2 delever \u2192 position \u00d7 0.5 = \u22120.125"],
+         ["verdict","approved \u00b7 risk_level medium \u00b7 target_position = \u22120.125 (a 12.5% short)"]]},
+    {name:"Execution agent",skills:"execute_paper",
+     input:[["3 values","target_position + current holding + reference price"]],
+     output:[["2 fields","execution_status (filled / not_submitted) \u00b7 filled_price \u2014 the order is the delta only (target \u2212 holding), costed at fee 4bp + slippage 3bp per side"]],
+     ex:[["netting","target \u22120.125 \u2212 current 0 \u2192 sell order for 12.5% of the book"],
+         ["fill","execution_status = filled \u00b7 costs deducted: fee 4bp + slippage 3bp"]]},
+    {name:"Review agent",skills:"review_decision",
+     input:[["full state","the complete decision state accumulated across all six agents"]],
+     output:[["1 record","the decision record"],
+             ["1 audit id","symbol + time + model + data + code + config hash + environment hash \u2014 every number is reproducible from this id alone"]],
+     ex:[["record","action=short \u00b7 target=\u22120.125 \u00b7 cb=L2 \u00b7 reason='drawdown>15% (L2 delever)'"],
+         ["audit id","DOGEUSDT__2026061204__model=demo__data=demo__code=dev__config=03b05360dcde__env=\u2026"]]}
+  ];
+  var pipeEl=document.getElementById("archPipe");
+  if(!pipeEl) return;
+  A.forEach(function(a,i){
+    var n=document.createElement("div");
+    n.id="archN"+i;
+    n.style.cssText="border:1px solid var(--line);border-radius:10px;padding:9px 12px;cursor:pointer;transition:all .3s;background:#12151d;";
+    n.innerHTML='<div style="display:flex;align-items:center;gap:8px"><span id="archNum'+i+'" style="font-size:12px;font-weight:600;color:var(--muted);min-width:14px">'+(i+1)+'</span><span style="font-size:13px;font-weight:600">'+a.name+'</span>'+(a.veto?'<span class="pill bad" style="margin-left:auto">veto</span>':'')+'</div>'+
+      '<div style="font-size:11px;color:var(--muted);margin-top:2px;font-family:ui-monospace,Consolas,monospace">'+a.skills+'</div>';
+    n.onclick=function(){if(archPlaying)archStop();archRender(i);};
+    pipeEl.appendChild(n);
+    if(i<A.length-1){
+      var ar=document.createElement("div");
+      ar.style.cssText="text-align:center;color:var(--dim);font-size:13px;line-height:1;padding:3px 0";
+      ar.textContent="\u2193";
+      pipeEl.appendChild(ar);
+    }
+  });
+  function archRows(title,items,accent){
+    var h='<div style="font-size:13px;font-weight:600;color:'+(accent?'var(--blue)':'var(--muted)')+';margin:0 0 6px">'+title+'</div>';
+    items.forEach(function(it){
+      h+='<div style="display:grid;grid-template-columns:88px minmax(0,1fr);gap:10px;padding:8px 10px;border-radius:8px;margin-bottom:5px;background:'+(accent?'#172033':'#12151d')+';border:1px solid '+(accent?'#2b3a5e':'var(--line)')+'">'+
+        '<div style="font-size:12px;font-weight:600;color:'+(accent?'var(--blue)':'var(--fg)')+'">'+it[0]+'</div>'+
+        '<div style="font-size:13px;line-height:1.55;color:'+(accent?'#c7d6f2':'var(--fg)')+'">'+it[1]+'</div></div>';
+    });
+    return '<div style="margin-bottom:14px">'+h+'</div>';
+  }
+  function archEx(items){
+    var h='<div style="font-size:13px;font-weight:600;color:var(--amber);margin:0 0 6px">Worked example \u00b7 DOGE/USDT, one demo decision (breaker L2)</div>';
+    items.forEach(function(it){
+      h+='<div style="display:grid;grid-template-columns:98px minmax(0,1fr);gap:10px;padding:8px 10px;border-radius:8px;margin-bottom:5px;background:#1b1710;border:1px solid #3a2f14">'+
+        '<div style="font-size:12px;font-weight:600;color:var(--amber)">'+it[0]+'</div>'+
+        '<div style="font-size:12.5px;line-height:1.6;color:#e8d9a8;font-family:ui-monospace,Consolas,monospace">'+it[1]+'</div></div>';
+    });
+    return '<div style="margin-bottom:14px">'+h+'</div>';
+  }
+  var archCur=0,archPlaying=false,archTimer=null;
+  function archRender(i){
+    archCur=i;
+    A.forEach(function(a,k){
+      var n=document.getElementById("archN"+k),on=(k===i);
+      n.style.borderColor=on?"var(--blue)":"var(--line)";
+      n.style.background=on?"#172033":"#12151d";
+      n.style.boxShadow=on?"0 0 10px -3px var(--blue)":"none";
+      n.style.opacity=(k<=i)?"1":"0.5";
+      document.getElementById("archNum"+k).style.color=on?"var(--blue)":"var(--muted)";
+    });
+    var a=A[i];
+    document.getElementById("archDetail").innerHTML=
+      '<div style="font-size:16px;font-weight:600;margin:0 0 12px">'+(i+1)+' \u00b7 '+a.name+'</div>'+
+      archRows("Input",a.input)+(a.proc?archRows("Processing",a.proc):'')+archRows("Output",a.output,1)+(a.ex?archEx(a.ex):'');
+  }
+  function archStop(){archPlaying=false;if(archTimer)clearInterval(archTimer);
+    document.getElementById("archPlay").textContent=archCur>=A.length-1?"\u21ba Replay":"\u25b6 Play";}
+  function archPlayFn(){
+    if(archPlaying){archStop();return;}
+    archPlaying=true;if(archCur>=A.length-1)archRender(0);
+    document.getElementById("archPlay").textContent="\u275a\u275a Pause";
+    archTimer=setInterval(function(){if(archCur<A.length-1)archRender(archCur+1);else archStop();},5000);
+  }
+  document.getElementById("archPlay").onclick=archPlayFn;
+  document.getElementById("archNext").onclick=function(){if(archPlaying)archStop();if(archCur<A.length-1)archRender(archCur+1);};
+  document.getElementById("archPrev").onclick=function(){if(archPlaying)archStop();if(archCur>0)archRender(archCur-1);};
+  archRender(0);
+})();
 loadResults();
 </script></body></html>
 """
@@ -451,11 +605,11 @@ def api_decide():
                       sym, cb_level=cb_level, auto_cb=auto_cb, broker=s["broker"])
         if out is None:
             avail = sorted(s["feats"]["symbol"].unique().tolist()) if s.get("feats") is not None else []
-            return jsonify({"error": f"该标的无可用决策数据：{sym}。可用标的：{', '.join(avail) or '(无)'}"}), 200
+            return jsonify({"error": f"No decision data for {sym}. Available: {', '.join(avail) or '(none)'}"}), 200
         return jsonify(out)
     except Exception as e:
         import traceback; traceback.print_exc()
-        return jsonify({"error": f"决策执行异常：{e}"}), 200
+        return jsonify({"error": f"Decision failed: {e}"}), 200
 
 @app.route("/api/reset_positions", methods=["POST"])
 def api_reset():

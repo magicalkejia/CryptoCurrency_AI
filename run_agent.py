@@ -34,11 +34,11 @@ from crypto.orchestration.graph import TradingGraph, decision_to_json
 # Demo drawdown injection: map specific symbols to a target trailing drawdown
 # (measured over the last ~90 days / 540 4h-bars) so the data-driven circuit
 # breaker fires a real L1/L2/L3 in synthetic mode. Thresholds (live CircuitBreaker
-# defaults): L1 > 10% drawdown, L2 > 15%, L3 > 20%.
+# defaults): L1 > 20% drawdown, L2 > 25%, L3 > 30%.
 DEMO_DRAWDOWN = {
-    "SOL/USDT": 0.12,   # -> L1 (warn)   : >10%
-    "DOGE/USDT": 0.18,  # -> L2 (delever): >15%
-    "XRP/USDT": 0.26,   # -> L3 (halt)   : >20%
+    "SOL/USDT": 0.23,   # -> L1 (warn)   : >20%
+    "DOGE/USDT": 0.28,  # -> L2 (delever): >25%
+    "XRP/USDT": 0.34,   # -> L3 (halt)   : >30%
 }
 
 def _synth_bars(seed, n=24 * 200, symbol=None):
